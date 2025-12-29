@@ -125,13 +125,32 @@ class VulpesBridge {
             return nil
         }
 
-        guard result.status == 200 else {
+        // Handle non-200 responses gracefully
+        if result.status != 200 {
             NSLog("VulpesBridge: fetchAndExtract - HTTP status \(result.status)")
-            return nil
+            // Try to extract content anyway (404 pages often have useful info)
+            if let text = extractText(from: result.body), !text.isEmpty {
+                return "HTTP \(result.status)\n\n\(text)"
+            }
+            return "HTTP \(result.status) - \(httpStatusMessage(Int(result.status)))"
         }
 
         let text = extractText(from: result.body)
         NSLog("VulpesBridge: fetchAndExtract - extracted text: \(text?.prefix(100) ?? "nil")")
         return text
+    }
+
+    /// Get human-readable HTTP status message
+    private func httpStatusMessage(_ status: Int) -> String {
+        switch status {
+        case 400: return "Bad Request"
+        case 401: return "Unauthorized"
+        case 403: return "Forbidden"
+        case 404: return "Page Not Found"
+        case 500: return "Internal Server Error"
+        case 502: return "Bad Gateway"
+        case 503: return "Service Unavailable"
+        default: return "Error"
+        }
     }
 }

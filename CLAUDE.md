@@ -245,8 +245,39 @@ xcodebuild -project Vulpes.xcodeproj -scheme Vulpes build
 /Users/ejfox/Library/Developer/Xcode/DerivedData/Vulpes-*/Build/Products/Debug/Vulpes.app/Contents/MacOS/Vulpes
 ```
 
+## Keyboard Navigation (Implemented)
+
+The browser now supports vim-style keyboard navigation:
+
+| Key | Action |
+|-----|--------|
+| `j` | Scroll down one line |
+| `k` | Scroll up one line |
+| `d` | Scroll down half page |
+| `u` | Scroll up half page |
+| `G` | Jump to bottom |
+| `gg` | Jump to top |
+| `1-9` | Follow numbered link |
+| Trackpad/Mouse wheel | Smooth scrolling |
+
+## Link Extraction (Implemented)
+
+- Links are extracted from `<a href="...">` tags
+- **Blue link text** - Links render in traditional blue (#6699FF)
+- Numbered inline: "Click here [1]"
+- Link reference section appended at end:
+  ```
+  ---
+  Links:
+  [1] https://example.com
+  [2] /relative/path
+  ```
+- Press 1-9 to follow links
+- Relative URLs resolved against current page
+- **URL bar updates** when navigating via link
+
 ## Next Steps
 
-1. **Keyboard navigation** - Vim-style scrolling (j/k), link hints
-2. **Scroll support** - Handle mouse wheel / trackpad scrolling
-3. **Link extraction** - Parse `<a>` tags, enable clicking/keyboard navigation
+1. **Back navigation** - Track history, `b` key to go back
+2. **URL bar interaction** - Focus URL bar with `/` or `Cmd+L`
+3. **Search** - In-page search with `/` key

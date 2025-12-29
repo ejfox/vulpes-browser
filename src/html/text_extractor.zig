@@ -8,9 +8,18 @@
 //!   - Decode common HTML entities
 //!   - Preserve meaningful whitespace/line breaks
 //!   - Fast single-pass parsing
+//!   - Extract and number links
 //!
 
 const std = @import("std");
+
+/// Maximum number of links to track
+const MAX_LINKS = 99;
+
+/// Control characters for marking link text
+/// These are parsed by Swift to apply blue color
+const LINK_START: u8 = 0x01; // SOH - Start of Heading
+const LINK_END: u8 = 0x02; // STX - Start of Text
 
 /// Tags whose content should be completely skipped
 const skip_tags = [_][]const u8{
@@ -30,7 +39,6 @@ const skip_tags = [_][]const u8{
 const block_tags = [_][]const u8{
     "p",
     "div",
-    "br",
     "h1",
     "h2",
     "h3",
@@ -53,9 +61,20 @@ const block_tags = [_][]const u8{
 
 /// Extract visible text from HTML content.
 /// Caller owns returned slice and must free with same allocator.
+/// Links are extracted and appended at the end as numbered references.
 pub fn extractText(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
     var result: std.ArrayListUnmanaged(u8) = .empty;
     errdefer result.deinit(allocator);
+
+    // Track extracted links
+    var links: [MAX_LINKS][]const u8 = undefined;
+    var link_count: usize = 0;
+
+    // Track current link state
+    var in_link: bool = false;
+    var current_href: ?[]const u8 = null;
+    var in_pre: bool = false;
+    var list_depth: u8 = 0;
 
     var i: usize = 0;
     var in_skip_tag: ?[]const u8 = null;
@@ -79,12 +98,48 @@ pub fn extractText(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
                         in_skip_tag = null;
                     }
                 } else {
+                    if (std.ascii.eqlIgnoreCase(tag_name, "pre")) {
+                        in_pre = false;
+                        try appendNewlines(allocator, &result, 2);
+                        last_was_space = true;
+                    }
+
+                    if (std.ascii.eqlIgnoreCase(tag_name, "ul") or std.ascii.eqlIgnoreCase(tag_name, "ol")) {
+                        if (list_depth > 0) list_depth -= 1;
+                        try appendNewlines(allocator, &result, 1);
+                        last_was_space = true;
+                    }
+
+                    // Check for closing </a> tag
+                    if (std.ascii.eqlIgnoreCase(tag_name, "a")) {
+                        if (in_link and current_href != null) {
+                            // Mark end of link text
+                            try result.append(allocator, LINK_END);
+
+                            // Add link number marker
+                            if (link_count < MAX_LINKS) {
+                                links[link_count] = current_href.?;
+                                link_count += 1;
+
+                                // Insert [N] marker
+                                try result.append(allocator, ' ');
+                                try result.append(allocator, '[');
+                                var num_buf: [3]u8 = undefined;
+                                const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{link_count}) catch "?";
+                                try result.appendSlice(allocator, num_str);
+                                try result.append(allocator, ']');
+                                last_was_space = false;
+                            }
+                        }
+                        in_link = false;
+                        current_href = null;
+                    }
+
                     // Check if block tag - add newline
                     if (isBlockTag(tag_name)) {
-                        if (result.items.len > 0 and result.items[result.items.len - 1] != '\n') {
-                            try result.append(allocator, '\n');
-                            last_was_space = true;
-                        }
+                        const spacing = blockSpacing(tag_name);
+                        try appendNewlines(allocator, &result, spacing);
+                        last_was_space = true;
                     }
                 }
             } else {
@@ -96,17 +151,57 @@ pub fn extractText(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
                     in_skip_tag = tag_name;
                 }
 
+                if (std.ascii.eqlIgnoreCase(tag_name, "pre")) {
+                    in_pre = true;
+                    try appendNewlines(allocator, &result, 2);
+                    last_was_space = true;
+                }
+
+                if (std.ascii.eqlIgnoreCase(tag_name, "ul") or std.ascii.eqlIgnoreCase(tag_name, "ol")) {
+                    if (list_depth < 10) list_depth += 1;
+                    try appendNewlines(allocator, &result, 2);
+                    last_was_space = true;
+                }
+
+                if (std.ascii.eqlIgnoreCase(tag_name, "li")) {
+                    try appendNewlines(allocator, &result, 1);
+                    for (0..list_depth) |_| {
+                        try result.appendSlice(allocator, "  ");
+                    }
+                    try result.appendSlice(allocator, "- ");
+                    last_was_space = true;
+                }
+
+                // Check for <a> tag and extract href
+                if (std.ascii.eqlIgnoreCase(tag_name, "a")) {
+                    current_href = extractHref(html[i..tag_end + 1]);
+                    if (current_href != null and link_count < MAX_LINKS) {
+                        in_link = true;
+                        // Mark start of link text for blue styling
+                        try result.append(allocator, LINK_START);
+                    } else {
+                        in_link = false;
+                        current_href = null;
+                    }
+                }
+
                 // Block tags add newline before
                 if (isBlockTag(tag_name)) {
-                    if (result.items.len > 0 and result.items[result.items.len - 1] != '\n') {
-                        try result.append(allocator, '\n');
-                        last_was_space = true;
-                    }
+                    const spacing = blockSpacing(tag_name);
+                    try appendNewlines(allocator, &result, spacing);
+                    last_was_space = true;
                 }
 
                 // Handle self-closing br
                 if (std.ascii.eqlIgnoreCase(tag_name, "br")) {
-                    try result.append(allocator, '\n');
+                    try appendNewlines(allocator, &result, 1);
+                    last_was_space = true;
+                }
+
+                if (std.ascii.eqlIgnoreCase(tag_name, "hr")) {
+                    try appendNewlines(allocator, &result, 1);
+                    try result.appendSlice(allocator, "----------------------------------------");
+                    try appendNewlines(allocator, &result, 1);
                     last_was_space = true;
                 }
             }
@@ -125,7 +220,7 @@ pub fn extractText(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
         if (html[i] == '&') {
             const entity_end = std.mem.indexOfScalarPos(u8, html, i + 1, ';') orelse {
                 // Not a valid entity, treat as text
-                if (!last_was_space) {
+                if (in_pre or !last_was_space) {
                     try result.append(allocator, html[i]);
                 }
                 i += 1;
@@ -142,14 +237,19 @@ pub fn extractText(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
             const entity = html[i + 1 .. entity_end];
             const decoded = decodeEntity(entity);
             if (decoded) |char| {
-                if (char == ' ' or char == '\n' or char == '\t') {
-                    if (!last_was_space) {
-                        try result.append(allocator, ' ');
-                        last_was_space = true;
-                    }
-                } else {
+                if (in_pre) {
                     try result.append(allocator, char);
-                    last_was_space = false;
+                    last_was_space = (char == ' ' or char == '\n' or char == '\t' or char == '\r');
+                } else {
+                    if (char == ' ' or char == '\n' or char == '\t') {
+                        if (!last_was_space) {
+                            try result.append(allocator, ' ');
+                            last_was_space = true;
+                        }
+                    } else {
+                        try result.append(allocator, char);
+                        last_was_space = false;
+                    }
                 }
             }
             i = entity_end + 1;
@@ -158,14 +258,19 @@ pub fn extractText(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
 
         // Regular text
         const char = html[i];
-        if (char == ' ' or char == '\n' or char == '\r' or char == '\t') {
-            if (!last_was_space) {
-                try result.append(allocator, ' ');
-                last_was_space = true;
-            }
-        } else {
+        if (in_pre) {
             try result.append(allocator, char);
-            last_was_space = false;
+            last_was_space = (char == ' ' or char == '\n' or char == '\r' or char == '\t');
+        } else {
+            if (char == ' ' or char == '\n' or char == '\r' or char == '\t') {
+                if (!last_was_space) {
+                    try result.append(allocator, ' ');
+                    last_was_space = true;
+                }
+            } else {
+                try result.append(allocator, char);
+                last_was_space = false;
+            }
         }
 
         i += 1;
@@ -178,6 +283,20 @@ pub fn extractText(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
             _ = result.pop();
         } else {
             break;
+        }
+    }
+
+    // Append links section if we found any
+    if (link_count > 0) {
+        try result.appendSlice(allocator, "\n\n---\nLinks:\n");
+        for (links[0..link_count], 1..) |href, num| {
+            try result.append(allocator, '[');
+            var num_buf: [3]u8 = undefined;
+            const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{num}) catch "?";
+            try result.appendSlice(allocator, num_str);
+            try result.appendSlice(allocator, "] ");
+            try result.appendSlice(allocator, href);
+            try result.append(allocator, '\n');
         }
     }
 
@@ -197,6 +316,54 @@ fn getTagName(tag_content: []const u8) []const u8 {
     return tag_content[0..end];
 }
 
+/// Extract href attribute value from an <a> tag
+fn extractHref(tag: []const u8) ?[]const u8 {
+    // Look for href= (case insensitive)
+    var i: usize = 0;
+    while (i + 5 < tag.len) {
+        if ((tag[i] == 'h' or tag[i] == 'H') and
+            (tag[i + 1] == 'r' or tag[i + 1] == 'R') and
+            (tag[i + 2] == 'e' or tag[i + 2] == 'E') and
+            (tag[i + 3] == 'f' or tag[i + 3] == 'F') and
+            tag[i + 4] == '=')
+        {
+            i += 5;
+
+            // Skip whitespace
+            while (i < tag.len and (tag[i] == ' ' or tag[i] == '\t')) {
+                i += 1;
+            }
+
+            if (i >= tag.len) return null;
+
+            // Check for quote
+            const quote = tag[i];
+            if (quote == '"' or quote == '\'') {
+                i += 1;
+                const start = i;
+                while (i < tag.len and tag[i] != quote) {
+                    i += 1;
+                }
+                if (i > start) {
+                    return tag[start..i];
+                }
+            } else {
+                // Unquoted value - ends at space or >
+                const start = i;
+                while (i < tag.len and tag[i] != ' ' and tag[i] != '>' and tag[i] != '\t') {
+                    i += 1;
+                }
+                if (i > start) {
+                    return tag[start..i];
+                }
+            }
+            return null;
+        }
+        i += 1;
+    }
+    return null;
+}
+
 fn isSkipTag(name: []const u8) bool {
     for (skip_tags) |skip| {
         if (std.ascii.eqlIgnoreCase(name, skip)) {
@@ -213,6 +380,46 @@ fn isBlockTag(name: []const u8) bool {
         }
     }
     return false;
+}
+
+fn blockSpacing(name: []const u8) u8 {
+    if (std.ascii.eqlIgnoreCase(name, "p") or
+        std.ascii.eqlIgnoreCase(name, "div") or
+        std.ascii.eqlIgnoreCase(name, "h1") or
+        std.ascii.eqlIgnoreCase(name, "h2") or
+        std.ascii.eqlIgnoreCase(name, "h3") or
+        std.ascii.eqlIgnoreCase(name, "h4") or
+        std.ascii.eqlIgnoreCase(name, "h5") or
+        std.ascii.eqlIgnoreCase(name, "h6") or
+        std.ascii.eqlIgnoreCase(name, "blockquote") or
+        std.ascii.eqlIgnoreCase(name, "pre") or
+        std.ascii.eqlIgnoreCase(name, "section") or
+        std.ascii.eqlIgnoreCase(name, "article") or
+        std.ascii.eqlIgnoreCase(name, "header") or
+        std.ascii.eqlIgnoreCase(name, "footer") or
+        std.ascii.eqlIgnoreCase(name, "nav") or
+        std.ascii.eqlIgnoreCase(name, "aside") or
+        std.ascii.eqlIgnoreCase(name, "main"))
+    {
+        return 2;
+    }
+
+    return 1;
+}
+
+fn appendNewlines(allocator: std.mem.Allocator, result: *std.ArrayListUnmanaged(u8), count: u8) !void {
+    if (count == 0 or result.items.len == 0) return;
+    var existing: u8 = 0;
+    var idx = result.items.len;
+    while (idx > 0 and result.items[idx - 1] == '\n' and existing < count) {
+        existing += 1;
+        idx -= 1;
+    }
+
+    if (existing >= count) return;
+    for (existing..count) |_| {
+        try result.append(allocator, '\n');
+    }
 }
 
 fn decodeEntity(entity: []const u8) ?u8 {
@@ -272,7 +479,7 @@ test "skip script tags" {
     const text = try extractText(std.testing.allocator, html);
     defer std.testing.allocator.free(text);
 
-    try std.testing.expectEqualStrings("Before\nAfter", text);
+    try std.testing.expectEqualStrings("Before\n\nAfter", text);
 }
 
 test "decode entities" {
@@ -296,5 +503,24 @@ test "block elements add newlines" {
     const text = try extractText(std.testing.allocator, html);
     defer std.testing.allocator.free(text);
 
-    try std.testing.expectEqualStrings("Title\nParagraph", text);
+    try std.testing.expectEqualStrings("Title\n\nParagraph", text);
+}
+
+test "extract links with href" {
+    const html = "<p>Visit <a href=\"https://example.com\">Example</a> for more info.</p>";
+    const text = try extractText(std.testing.allocator, html);
+    defer std.testing.allocator.free(text);
+
+    // Should contain link marker and link section
+    try std.testing.expect(std.mem.indexOf(u8, text, "[1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "https://example.com") != null);
+}
+
+test "multiple links numbered correctly" {
+    const html = "<p><a href=\"/a\">A</a> and <a href=\"/b\">B</a></p>";
+    const text = try extractText(std.testing.allocator, html);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "[1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "[2]") != null);
 }

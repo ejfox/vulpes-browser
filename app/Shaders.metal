@@ -92,6 +92,195 @@ fragment float4 fragmentShaderGlyph(
     return float4(in.color.rgb, in.color.a * alpha);
 }
 
+// MARK: - Particle and Glow Shaders
+
+// Particle fragment shader with soft edges and color shifting
+// Creates sparkly, chromatic particles that fade beautifully
+fragment float4 fragmentShaderParticle(VertexOut in [[stage_in]]) {
+    // Calculate distance from center of quad (texCoords are 0-1)
+    float2 center = float2(0.5, 0.5);
+    float2 offset = in.texCoord - center;
+    float dist = length(offset) * 2.0; // 0 at center, 1 at edge
+
+    // Multiple layers of glow for depth
+    float innerGlow = exp(-dist * dist * 8.0);  // Bright hot core
+    float midGlow = exp(-dist * dist * 3.0);    // Medium glow
+    float outerGlow = exp(-dist * dist * 1.5);  // Soft outer halo
+
+    // Combine layers
+    float alpha = innerGlow * 0.9 + midGlow * 0.5 + outerGlow * 0.2;
+
+    // Color shift based on distance - chromatic aberration effect
+    // Shifts color slightly toward blue at edges, warm at center
+    float3 color = in.color.rgb;
+    color.r += innerGlow * 0.3;  // Extra warmth at center
+    color.b += (1.0 - innerGlow) * 0.2;  // Blue tint at edges
+
+    // Sparkle effect - slight color variation based on angle
+    float angle = atan2(offset.y, offset.x);
+    float sparkle = sin(angle * 6.0) * 0.5 + 0.5;
+    color += sparkle * innerGlow * 0.15;
+
+    return float4(color, in.color.a * alpha);
+}
+
+// Glow fragment shader - creates a soft dreamy halo around links
+// Pure gaussian falloff - no hard edges
+fragment float4 fragmentShaderGlow(VertexOut in [[stage_in]]) {
+    // Map texCoords to -1 to 1 range
+    float2 uv = in.texCoord * 2.0 - 1.0;
+
+    // Pure gaussian falloff in both directions (no smoothstep = no hard edge)
+    float distX = uv.x * uv.x;
+    float distY = uv.y * uv.y;
+
+    // Gaussian with different spreads for X and Y (wider horizontally)
+    float gaussX = exp(-distX * 2.0);  // Wider spread
+    float gaussY = exp(-distY * 3.5);  // Tighter vertically
+
+    // Combine for soft pill shape
+    float alpha = gaussX * gaussY;
+
+    // Boost the center slightly
+    float centerBoost = exp(-(distX + distY) * 4.0);
+    alpha = alpha * 0.85 + centerBoost * 0.15;
+
+    // Soft color - slightly warmer at center
+    float3 color = in.color.rgb;
+    color.r += centerBoost * 0.05;
+    color.b += (1.0 - centerBoost) * 0.1;
+
+    return float4(color, in.color.a * alpha);
+}
+
+// MARK: - Bloom Post-Processing (Vulpes Style)
+//
+// Two-pass bloom: render scene to texture, then apply bloom
+// Based on Ghostty bloom-vulpes.glsl - glows bright pixels
+
+// Fullscreen quad vertex shader for post-processing
+// Input: vertex index 0-5 for two triangles covering screen
+vertex VertexOut vertexShaderFullscreen(
+    uint vertexID [[vertex_id]]
+) {
+    // Generate fullscreen quad from vertex ID
+    // Triangle 1: (0,1,2) Triangle 2: (2,1,3)
+    float2 positions[6] = {
+        float2(-1, -1), float2(1, -1), float2(-1, 1),  // Triangle 1
+        float2(-1, 1), float2(1, -1), float2(1, 1)     // Triangle 2
+    };
+    float2 texCoords[6] = {
+        float2(0, 1), float2(1, 1), float2(0, 0),  // Flip Y for Metal
+        float2(0, 0), float2(1, 1), float2(1, 0)
+    };
+
+    VertexOut out;
+    out.position = float4(positions[vertexID], 0.0, 1.0);
+    out.texCoord = texCoords[vertexID];
+    out.color = float4(1.0);
+    return out;
+}
+
+// Bloom sample offsets - spiral pattern for nice distribution
+constant float3 bloomSamples[24] = {
+    float3(0.169, 0.986, 1.0),
+    float3(-1.333, 0.472, 0.707),
+    float3(-0.846, -1.511, 0.577),
+    float3(1.554, -1.259, 0.5),
+    float3(1.681, 1.474, 0.447),
+    float3(-1.280, 2.089, 0.408),
+    float3(-2.458, -0.980, 0.378),
+    float3(0.587, -2.767, 0.354),
+    float3(2.998, 0.117, 0.333),
+    float3(0.414, 3.135, 0.316),
+    float3(-3.167, 0.984, 0.302),
+    float3(-1.574, -3.086, 0.289),
+    float3(2.888, -2.158, 0.277),
+    float3(2.715, 2.575, 0.267),
+    float3(-2.150, 3.221, 0.258),
+    float3(-3.655, -1.625, 0.250),
+    float3(1.013, -3.997, 0.243),
+    float3(4.230, 0.331, 0.236),
+    float3(0.401, 4.340, 0.229),
+    float3(-4.319, 1.160, 0.224),
+    float3(-1.921, -4.161, 0.218),
+    float3(3.864, -2.659, 0.213),
+    float3(3.349, 3.433, 0.209),
+    float3(-2.877, 3.965, 0.204)
+};
+
+// Bloom tuning
+constant float BLOOM_INTENSITY = 0.12;   // Glow strength
+constant float LUM_THRESHOLD = 0.25;     // Min brightness to bloom
+constant float BLOOM_RADIUS = 2.5;       // Sample spread
+
+// Luminance calculation
+float luminance(float4 c) {
+    return 0.299 * c.r + 0.587 * c.g + 0.114 * c.b;
+}
+
+// Check if pixel should bloom (bright or has strong color)
+bool shouldBloom(float4 c) {
+    float brightness = max(max(c.r, c.g), c.b);
+    // Bloom bright pixels and strong blues (links)
+    bool veryBright = brightness > 0.5;
+    bool isBlue = c.b > 0.6 && c.b > c.r * 1.1;
+    bool isRed = c.r > 0.7 && c.r > c.g * 1.1;
+    return veryBright || isBlue || isRed;
+}
+
+// Bloom fragment shader - samples surrounding pixels and adds glow
+fragment float4 fragmentShaderBloom(
+    VertexOut in [[stage_in]],
+    texture2d<float> sceneTexture [[texture(0)]]
+) {
+    constexpr sampler texSampler(
+        mag_filter::linear,
+        min_filter::linear,
+        address::clamp_to_edge
+    );
+
+    float2 uv = in.texCoord;
+    float4 color = sceneTexture.sample(texSampler, uv);
+
+    // Get texture dimensions for proper scaling
+    float2 texSize = float2(sceneTexture.get_width(), sceneTexture.get_height());
+    float2 step = float2(BLOOM_RADIUS) / texSize;
+
+    // Accumulate bloom from surrounding pixels
+    for (int i = 0; i < 24; i++) {
+        float3 s = bloomSamples[i];
+        float4 c = sceneTexture.sample(texSampler, uv + s.xy * step);
+        float l = luminance(c);
+
+        // Only bloom bright/colored pixels
+        if (l > LUM_THRESHOLD && shouldBloom(c)) {
+            color += l * s.z * c * BLOOM_INTENSITY;
+        }
+    }
+
+    // Subtle blue emphasis for link glow
+    float4 original = sceneTexture.sample(texSampler, uv);
+    float4 bloomOnly = color - original;
+    bloomOnly.b *= 1.15;  // Slight blue boost
+    color = original + bloomOnly;
+
+    return color;
+}
+
+// Simple passthrough for when bloom is disabled
+fragment float4 fragmentShaderPassthrough(
+    VertexOut in [[stage_in]],
+    texture2d<float> sceneTexture [[texture(0)]]
+) {
+    constexpr sampler texSampler(
+        mag_filter::linear,
+        min_filter::linear,
+        address::clamp_to_edge
+    );
+    return sceneTexture.sample(texSampler, in.texCoord);
+}
+
 // MARK: - Future: Subpixel Antialiasing
 //
 // For macOS text rendering quality, we could implement subpixel AA:

@@ -35,6 +35,13 @@ struct Uniforms {
     var viewportSize: SIMD2<Float>
 }
 
+// For custom GLSL shaders (Ghostty/Shadertoy compatibility)
+struct PostProcessUniforms {
+    var iResolution: SIMD2<Float>
+    var iTime: Float
+    var _padding: Float = 0  // Align to 16 bytes
+}
+
 class MetalView: NSView {
 
     // MARK: - Metal Infrastructure
@@ -49,6 +56,18 @@ class MetalView: NSView {
     // Render pipelines for different draw modes
     private var solidPipelineState: MTLRenderPipelineState!
     private var glyphPipelineState: MTLRenderPipelineState!
+    private var particlePipelineState: MTLRenderPipelineState!  // Additive blending for particles
+    private var glowPipelineState: MTLRenderPipelineState!      // Additive blending for link glow
+    private var bloomPipelineState: MTLRenderPipelineState!     // Post-process bloom effect
+    private var customShaderPipeline: MTLRenderPipelineState?   // Custom GLSL shader (optional)
+
+    // Offscreen render target for two-pass bloom
+    private var offscreenTexture: MTLTexture?
+    private var bloomEnabled: Bool = true
+
+    // Post-process uniforms for custom shaders (Shadertoy/Ghostty compatibility)
+    private var postProcessUniformBuffer: MTLBuffer?
+    private var shaderStartTime: CFAbsoluteTime = 0
 
     // Vertex descriptor for our Vertex struct
     private var vertexDescriptor: MTLVertexDescriptor!
@@ -68,6 +87,64 @@ class MetalView: NSView {
     private var displayedText: String = "Loading..."
     private var currentURL: String = ""
 
+    // Extracted links for navigation
+    private var extractedLinks: [String] = []
+
+    // Focused link for Tab navigation (-1 = no focus, 0+ = link index)
+    private var focusedLinkIndex: Int = -1
+
+    // Link hit boxes for click detection (in point coordinates, not pixels)
+    private struct LinkHitBox {
+        let linkIndex: Int
+        var minX: Float
+        var minY: Float
+        var maxX: Float
+        var maxY: Float
+    }
+    private var linkHitBoxes: [LinkHitBox] = []
+
+    // Hovered link for glow effect with animation
+    private var hoveredLinkIndex: Int = -1
+    private var glowIntensity: Float = 0.0        // Current glow level (0-1)
+    private var targetGlowIntensity: Float = 0.0  // Target glow level
+    private var lastGlowUpdate: CFAbsoluteTime = 0
+    private let glowFadeInSpeed: Float = 8.0      // How fast glow appears
+    private let glowFadeOutSpeed: Float = 2.5     // How slow glow fades (inertia)
+
+    // MARK: - Particle System
+    private struct Particle {
+        var x: Float
+        var y: Float
+        var vx: Float
+        var vy: Float
+        var life: Float  // 0-1, fades out as it decreases
+        var maxLife: Float
+        var size: Float
+        var r: Float
+        var g: Float
+        var b: Float
+    }
+    private var particles: [Particle] = []
+    private var particleVertexBuffer: MTLBuffer?
+    private var lastParticleUpdate: CFAbsoluteTime = 0
+    private let maxParticles = 2000
+    private let particleSpawnCount = 150  // Lots of tiny particles per click
+
+    // Callback when URL changes (for updating URL bar)
+    var onURLChange: ((String) -> Void)?
+
+    // Callback to focus URL bar
+    var onRequestURLBarFocus: (() -> Void)?
+
+    // Scroll state
+    private var scrollOffset: Float = 0.0
+    private var contentHeight: Float = 0.0  // Total height of rendered content
+    private var scrollSpeed: Float = 40.0   // Pixels per j/k press (configurable)
+
+    // Key sequence tracking (for gg, etc.)
+    private var lastKeyChar: String = ""
+    private var lastKeyTime: CFAbsoluteTime = 0
+
     // Track if fully initialized
     private var isMetalReady = false
 
@@ -86,6 +163,9 @@ class MetalView: NSView {
         layer.pixelFormat = .bgra8Unorm
         layer.framebufferOnly = true
         layer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2.0
+        // Transparent for frosted glass effect
+        layer.isOpaque = false
+        layer.backgroundColor = CGColor.clear
         return layer
     }
 
@@ -131,9 +211,63 @@ class MetalView: NSView {
         // Create glyph atlas for text rendering
         glyphAtlas = GlyphAtlas(device: device)
 
+        // Apply config settings
+        applyConfig()
+
+        // Try to load custom GLSL shader if configured
+        loadCustomShader()
+
+        // Record shader start time for iTime uniform
+        shaderStartTime = CFAbsoluteTimeGetCurrent()
+
         isMetalReady = true
         print("MetalView: Metal initialized successfully")
         print("  Device: \(device.name)")
+    }
+
+    /// Apply settings from VulpesConfig
+    private func applyConfig() {
+        let config = VulpesConfig.shared
+        bloomEnabled = config.bloomEnabled
+        scrollSpeed = config.scrollSpeed
+
+        // Create post-process uniform buffer for custom shaders
+        postProcessUniformBuffer = device.makeBuffer(
+            length: MemoryLayout<PostProcessUniforms>.stride,
+            options: .storageModeShared
+        )
+        postProcessUniformBuffer?.label = "PostProcess Uniforms"
+
+        print("MetalView: Config applied - bloom=\(bloomEnabled), homePage=\(config.homePage)")
+    }
+
+    /// Load custom GLSL shader if specified in config
+    private func loadCustomShader() {
+        guard let shaderPath = VulpesConfig.shared.shaderPath else {
+            print("MetalView: No custom shader configured, using built-in bloom")
+            return
+        }
+
+        print("MetalView: Loading custom shader from \(shaderPath)")
+
+        // Get the fullscreen vertex function from our library
+        guard let library = device.makeDefaultLibrary(),
+              let vertexFunction = library.makeFunction(name: "vertexShaderFullscreen") else {
+            print("MetalView: Failed to get fullscreen vertex shader")
+            return
+        }
+
+        // Use GLSL transpiler to load and compile the shader
+        if let pipeline = GLSLTranspiler.createPipeline(
+            from: shaderPath,
+            device: device,
+            vertexFunction: vertexFunction
+        ) {
+            customShaderPipeline = pipeline
+            print("MetalView: Custom shader loaded successfully!")
+        } else {
+            print("MetalView: Failed to load custom shader, falling back to built-in bloom")
+        }
     }
 
     private func setupVertexDescriptor() {
@@ -224,6 +358,86 @@ class MetalView: NSView {
             fatalError("MetalView: Failed to create glyph pipeline state: \(error)")
         }
 
+        // Create particle pipeline with ADDITIVE blending for glow effect
+        guard let fragmentParticle = library.makeFunction(name: "fragmentShaderParticle") else {
+            fatalError("MetalView: Failed to load fragmentShaderParticle function")
+        }
+
+        let particleDescriptor = MTLRenderPipelineDescriptor()
+        particleDescriptor.label = "Particle Pipeline"
+        particleDescriptor.vertexFunction = vertexFunction
+        particleDescriptor.fragmentFunction = fragmentParticle
+        particleDescriptor.vertexDescriptor = vertexDescriptor
+        particleDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+
+        // ADDITIVE blending: result = src * srcAlpha + dst * 1
+        // This makes particles glow by adding light to the scene
+        particleDescriptor.colorAttachments[0].isBlendingEnabled = true
+        particleDescriptor.colorAttachments[0].rgbBlendOperation = .add
+        particleDescriptor.colorAttachments[0].alphaBlendOperation = .add
+        particleDescriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        particleDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
+        particleDescriptor.colorAttachments[0].destinationRGBBlendFactor = .one
+        particleDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .one
+
+        do {
+            particlePipelineState = try device.makeRenderPipelineState(descriptor: particleDescriptor)
+        } catch {
+            fatalError("MetalView: Failed to create particle pipeline state: \(error)")
+        }
+
+        // Create glow pipeline - similar additive blending for link hover glow
+        guard let fragmentGlow = library.makeFunction(name: "fragmentShaderGlow") else {
+            fatalError("MetalView: Failed to load fragmentShaderGlow function")
+        }
+
+        let glowDescriptor = MTLRenderPipelineDescriptor()
+        glowDescriptor.label = "Glow Pipeline"
+        glowDescriptor.vertexFunction = vertexFunction
+        glowDescriptor.fragmentFunction = fragmentGlow
+        glowDescriptor.vertexDescriptor = vertexDescriptor
+        glowDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+
+        // Additive blending for glow
+        glowDescriptor.colorAttachments[0].isBlendingEnabled = true
+        glowDescriptor.colorAttachments[0].rgbBlendOperation = .add
+        glowDescriptor.colorAttachments[0].alphaBlendOperation = .add
+        glowDescriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        glowDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
+        glowDescriptor.colorAttachments[0].destinationRGBBlendFactor = .one
+        glowDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .one
+
+        do {
+            glowPipelineState = try device.makeRenderPipelineState(descriptor: glowDescriptor)
+        } catch {
+            fatalError("MetalView: Failed to create glow pipeline state: \(error)")
+        }
+
+        // Create bloom post-process pipeline (fullscreen quad with scene texture)
+        guard let vertexFullscreen = library.makeFunction(name: "vertexShaderFullscreen") else {
+            fatalError("MetalView: Failed to load vertexShaderFullscreen function")
+        }
+
+        guard let fragmentBloom = library.makeFunction(name: "fragmentShaderBloom") else {
+            fatalError("MetalView: Failed to load fragmentShaderBloom function")
+        }
+
+        let bloomDescriptor = MTLRenderPipelineDescriptor()
+        bloomDescriptor.label = "Bloom Pipeline"
+        bloomDescriptor.vertexFunction = vertexFullscreen
+        bloomDescriptor.fragmentFunction = fragmentBloom
+        // No vertex descriptor needed - we generate vertices in shader
+        bloomDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+
+        // Normal blending for final output
+        bloomDescriptor.colorAttachments[0].isBlendingEnabled = false
+
+        do {
+            bloomPipelineState = try device.makeRenderPipelineState(descriptor: bloomDescriptor)
+        } catch {
+            fatalError("MetalView: Failed to create bloom pipeline state: \(error)")
+        }
+
         print("MetalView: Render pipelines created")
     }
 
@@ -287,8 +501,13 @@ class MetalView: NSView {
     /// Load a URL and display extracted text
     func loadURL(_ url: String) {
         currentURL = url
+        scrollOffset = 0  // Reset scroll position for new page
+        focusedLinkIndex = -1  // Reset link focus
         displayedText = "Loading \(url)..."
         updateTextDisplay()
+
+        // Notify URL bar
+        onURLChange?(url)
 
         // Fetch in background
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -307,9 +526,39 @@ class MetalView: NSView {
 
             DispatchQueue.main.async {
                 self?.displayedText = text
+                self?.parseLinks(from: text)
                 self?.updateTextDisplay()
             }
         }
+    }
+
+    /// Parse links from the "Links:" section of extracted text
+    private func parseLinks(from text: String) {
+        extractedLinks = []
+
+        // Find the Links: section
+        guard let linksRange = text.range(of: "---\nLinks:\n") else {
+            return
+        }
+
+        let linksSection = String(text[linksRange.upperBound...])
+
+        // Parse each line like "[1] https://..."
+        for line in linksSection.components(separatedBy: "\n") {
+            // Skip empty lines
+            guard !line.isEmpty else { continue }
+
+            // Extract URL after "] "
+            if let bracketEnd = line.firstIndex(of: "]"),
+               let spaceAfter = line.index(bracketEnd, offsetBy: 1, limitedBy: line.endIndex),
+               line[spaceAfter] == " " {
+                let urlStart = line.index(after: spaceAfter)
+                let url = String(line[urlStart...])
+                extractedLinks.append(url)
+            }
+        }
+
+        print("MetalView: Parsed \(extractedLinks.count) links")
     }
 
     /// Update the text vertex buffer with current displayedText
@@ -330,8 +579,9 @@ class MetalView: NSView {
         }
 
         var glyphs = [CGGlyph](repeating: 0, count: chars.count)
-        let mapped = CTFontGetGlyphsForCharacters(font, chars, &glyphs, chars.count)
-        guard mapped else { return }
+        // Note: mapped may be false if some chars (like control chars) can't be mapped
+        // We continue anyway and skip unmappable glyphs
+        _ = CTFontGetGlyphsForCharacters(font, chars, &glyphs, chars.count)
 
         var vertices: [Vertex] = []
         vertices.reserveCapacity(glyphs.count * 6)
@@ -341,9 +591,56 @@ class MetalView: NSView {
         var penX: Float = margin
         var penY: Float = margin + Float(fontSize)
 
-        let color = SIMD4<Float>(0.9, 0.9, 0.9, 1.0)
+        // Apply scroll offset (negative = content moves up)
+        let scrollAdjust = -scrollOffset * Float(scale)
+
+        // Colors
+        let normalColor = SIMD4<Float>(0.9, 0.9, 0.9, 1.0)
+        let linkColor = SIMD4<Float>(0.4, 0.6, 1.0, 1.0)  // Traditional blue
+        let focusedLinkColor = SIMD4<Float>(1.0, 0.8, 0.2, 1.0)  // Gold/yellow for focus
+        var currentColor = normalColor
+        var currentLinkIndex = -1  // Track which link we're in
+
+        // Track link hit boxes
+        linkHitBoxes = []
+        var currentLinkHitBox: LinkHitBox? = nil
 
         for (i, glyph) in glyphs.enumerated() {
+            // Handle control characters for link styling
+            if chars[i] == 0x0001 { // LINK_START
+                currentLinkIndex += 1
+                if currentLinkIndex == focusedLinkIndex {
+                    currentColor = focusedLinkColor
+                } else {
+                    currentColor = linkColor
+                }
+                // Start tracking hit box for this link
+                currentLinkHitBox = LinkHitBox(
+                    linkIndex: currentLinkIndex,
+                    minX: Float.greatestFiniteMagnitude,
+                    minY: Float.greatestFiniteMagnitude,
+                    maxX: -Float.greatestFiniteMagnitude,
+                    maxY: -Float.greatestFiniteMagnitude
+                )
+                continue
+            }
+            if chars[i] == 0x0002 { // LINK_END
+                currentColor = normalColor
+                // Save hit box if we have one
+                if var hitBox = currentLinkHitBox {
+                    // Convert from pixels to points
+                    // Keep in CONTENT SPACE (don't add scrollOffset)
+                    // Mouse coords will be converted to content space for comparison
+                    hitBox.minX /= Float(scale)
+                    hitBox.minY /= Float(scale)
+                    hitBox.maxX /= Float(scale)
+                    hitBox.maxY /= Float(scale)
+                    linkHitBoxes.append(hitBox)
+                }
+                currentLinkHitBox = nil
+                continue
+            }
+
             // Handle newlines
             if chars[i] == 0x000A { // newline
                 penX = margin
@@ -363,24 +660,41 @@ class MetalView: NSView {
             // bearing.y is offset from baseline to bottom of glyph (negative for descenders)
             // In Y-down coords: top = baseline - (bearing.y + height), bottom = baseline - bearing.y
             let x1 = penX + Float(entry.bearing.x)
-            let y1 = penY - Float(entry.bearing.y) - Float(entry.size.height)  // top
+            let y1 = penY - Float(entry.bearing.y) - Float(entry.size.height) + scrollAdjust  // top
             let x2 = x1 + Float(entry.size.width)
-            let y2 = penY - Float(entry.bearing.y)  // bottom (at baseline for non-descenders)
+            let y2 = penY - Float(entry.bearing.y) + scrollAdjust  // bottom (at baseline for non-descenders)
 
             let u0 = Float(entry.uvRect.minX)
             let u1 = Float(entry.uvRect.maxX)
             let v0 = Float(entry.uvRect.maxY)
             let v1 = Float(entry.uvRect.minY)
 
-            vertices.append(Vertex(position: SIMD2<Float>(x1, y1), texCoord: SIMD2<Float>(u0, v0), color: color))
-            vertices.append(Vertex(position: SIMD2<Float>(x2, y1), texCoord: SIMD2<Float>(u1, v0), color: color))
-            vertices.append(Vertex(position: SIMD2<Float>(x1, y2), texCoord: SIMD2<Float>(u0, v1), color: color))
-            vertices.append(Vertex(position: SIMD2<Float>(x2, y1), texCoord: SIMD2<Float>(u1, v0), color: color))
-            vertices.append(Vertex(position: SIMD2<Float>(x2, y2), texCoord: SIMD2<Float>(u1, v1), color: color))
-            vertices.append(Vertex(position: SIMD2<Float>(x1, y2), texCoord: SIMD2<Float>(u0, v1), color: color))
+            vertices.append(Vertex(position: SIMD2<Float>(x1, y1), texCoord: SIMD2<Float>(u0, v0), color: currentColor))
+            vertices.append(Vertex(position: SIMD2<Float>(x2, y1), texCoord: SIMD2<Float>(u1, v0), color: currentColor))
+            vertices.append(Vertex(position: SIMD2<Float>(x1, y2), texCoord: SIMD2<Float>(u0, v1), color: currentColor))
+            vertices.append(Vertex(position: SIMD2<Float>(x2, y1), texCoord: SIMD2<Float>(u1, v0), color: currentColor))
+            vertices.append(Vertex(position: SIMD2<Float>(x2, y2), texCoord: SIMD2<Float>(u1, v1), color: currentColor))
+            vertices.append(Vertex(position: SIMD2<Float>(x1, y2), texCoord: SIMD2<Float>(u0, v1), color: currentColor))
+
+            // Expand link hit box if we're in a link
+            if currentLinkHitBox != nil {
+                // Use positions without scroll adjust for hit testing
+                let hitX1 = penX + Float(entry.bearing.x)
+                let hitY1 = penY - Float(entry.bearing.y) - Float(entry.size.height)
+                let hitX2 = hitX1 + Float(entry.size.width)
+                let hitY2 = penY - Float(entry.bearing.y)
+
+                currentLinkHitBox!.minX = min(currentLinkHitBox!.minX, hitX1)
+                currentLinkHitBox!.minY = min(currentLinkHitBox!.minY, hitY1)
+                currentLinkHitBox!.maxX = max(currentLinkHitBox!.maxX, hitX2)
+                currentLinkHitBox!.maxY = max(currentLinkHitBox!.maxY, hitY2)
+            }
 
             penX += Float(entry.advance)
         }
+
+        // Track content height for scroll bounds
+        contentHeight = penY / Float(scale)
 
         guard !vertices.isEmpty else {
             textVertexCount = 0
@@ -448,8 +762,8 @@ class MetalView: NSView {
         needsDisplay = true
         render()
 
-        // Load initial page
-        loadURL("https://ejfox.com")
+        // Load initial page from config
+        loadURL(VulpesConfig.shared.homePage)
     }
 
     override func viewWillMove(toWindow newWindow: NSWindow?) {
@@ -501,6 +815,31 @@ class MetalView: NSView {
         render()
     }
 
+    /// Ensure offscreen texture exists and matches drawable size
+    private func ensureOffscreenTexture(size: CGSize) {
+        let width = Int(size.width)
+        let height = Int(size.height)
+
+        // Check if we need to recreate
+        if let existing = offscreenTexture,
+           existing.width == width && existing.height == height {
+            return
+        }
+
+        // Create new offscreen texture
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .private
+
+        offscreenTexture = device.makeTexture(descriptor: descriptor)
+        offscreenTexture?.label = "Offscreen Scene Texture"
+    }
+
     func render() {
         guard isMetalReady else { return }
 
@@ -517,7 +856,6 @@ class MetalView: NSView {
             return
         }
 
-        print("MetalView: render() - drawableSize: \(drawableSize)")
         var uniforms = Uniforms(
             viewportSize: SIMD2<Float>(Float(drawableSize.width), Float(drawableSize.height))
         )
@@ -529,55 +867,118 @@ class MetalView: NSView {
             return
         }
 
-        // Create a render pass descriptor
-        let renderPassDescriptor = MTLRenderPassDescriptor()
-        renderPassDescriptor.colorAttachments[0].texture = drawable.texture
-        renderPassDescriptor.colorAttachments[0].loadAction = .clear
-        renderPassDescriptor.colorAttachments[0].storeAction = .store
+        // Update animations
+        let now = CFAbsoluteTimeGetCurrent()
+        if lastParticleUpdate > 0 {
+            let deltaTime = Float(now - lastParticleUpdate)
+            let cappedDelta = min(deltaTime, 0.1)  // Cap to avoid huge jumps
+            updateParticles(deltaTime: cappedDelta)
+            updateGlowAnimation(deltaTime: cappedDelta)
+        }
+        lastParticleUpdate = now
 
-        // Background color - dark theme default
-        // TODO: Get from libvulpes theme
-        renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColor(
-            red: 0.1,
-            green: 0.1,
-            blue: 0.12,
-            alpha: 1.0
+        // ============================================================
+        // PASS 1: Render scene to offscreen texture (if bloom enabled)
+        // ============================================================
+        let targetTexture: MTLTexture
+        if bloomEnabled {
+            ensureOffscreenTexture(size: drawableSize)
+            guard let offscreen = offscreenTexture else {
+                print("MetalView: Failed to create offscreen texture")
+                return
+            }
+            targetTexture = offscreen
+        } else {
+            targetTexture = drawable.texture
+        }
+
+        // Create render pass for scene
+        let scenePassDescriptor = MTLRenderPassDescriptor()
+        scenePassDescriptor.colorAttachments[0].texture = targetTexture
+        scenePassDescriptor.colorAttachments[0].loadAction = .clear
+        scenePassDescriptor.colorAttachments[0].storeAction = .store
+        scenePassDescriptor.colorAttachments[0].clearColor = MTLClearColor(
+            red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0
         )
 
-        // Create the render encoder
-        guard let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
-            print("MetalView: Failed to create render encoder")
+        guard let sceneEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: scenePassDescriptor) else {
+            print("MetalView: Failed to create scene encoder")
             return
         }
 
         // Set the solid color pipeline
-        renderEncoder.setRenderPipelineState(solidPipelineState)
+        sceneEncoder.setRenderPipelineState(solidPipelineState)
+        sceneEncoder.setVertexBuffer(uniformBuffer, offset: 0, index: 1)
 
-        // Bind uniform buffer (viewport size)
-        renderEncoder.setVertexBuffer(uniformBuffer, offset: 0, index: 1)
+        // Draw glow effect BEHIND text (if hovering a link)
+        let (glowBuffer, glowCount) = buildGlowVertices()
+        if let glowBuffer = glowBuffer, glowCount > 0 {
+            sceneEncoder.setRenderPipelineState(glowPipelineState)
+            sceneEncoder.setVertexBuffer(glowBuffer, offset: 0, index: 0)
+            sceneEncoder.setVertexBuffer(uniformBuffer, offset: 0, index: 1)
+            sceneEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: glowCount)
+        }
 
         // Draw text content using glyph atlas
         if let atlas = glyphAtlas, let textBuffer = textVertexBuffer, textVertexCount > 0 {
-            renderEncoder.setRenderPipelineState(glyphPipelineState)
-            renderEncoder.setVertexBuffer(textBuffer, offset: 0, index: 0)
-            renderEncoder.setVertexBuffer(uniformBuffer, offset: 0, index: 1)
-            renderEncoder.setFragmentTexture(atlas.texture, index: 0)
-            renderEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: textVertexCount)
+            sceneEncoder.setRenderPipelineState(glyphPipelineState)
+            sceneEncoder.setVertexBuffer(textBuffer, offset: 0, index: 0)
+            sceneEncoder.setVertexBuffer(uniformBuffer, offset: 0, index: 1)
+            sceneEncoder.setFragmentTexture(atlas.texture, index: 0)
+            sceneEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: textVertexCount)
         }
 
-        // TODO: Process render commands from libvulpes
-        // let commands = VulpesBridge.shared.getRenderCommands()
-        // for command in commands {
-        //     switch command {
-        //     case .rect(let rect, let color):
-        //         drawRect(encoder: renderEncoder, rect: rect, color: color)
-        //     case .glyph(let glyph, let position, let color):
-        //         drawGlyph(encoder: renderEncoder, glyph: glyph, position: position, color: color)
-        //     }
-        // }
+        // Draw particles ON TOP of text (additive blending for glow)
+        let (particleBuffer, particleCount) = buildParticleVertices()
+        if let particleBuffer = particleBuffer, particleCount > 0 {
+            sceneEncoder.setRenderPipelineState(particlePipelineState)
+            sceneEncoder.setVertexBuffer(particleBuffer, offset: 0, index: 0)
+            sceneEncoder.setVertexBuffer(uniformBuffer, offset: 0, index: 1)
+            sceneEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: particleCount)
+        }
 
-        // Finish encoding
-        renderEncoder.endEncoding()
+        sceneEncoder.endEncoding()
+
+        // ============================================================
+        // PASS 2: Apply post-process shader (bloom or custom GLSL)
+        // ============================================================
+        if bloomEnabled {
+            let bloomPassDescriptor = MTLRenderPassDescriptor()
+            bloomPassDescriptor.colorAttachments[0].texture = drawable.texture
+            bloomPassDescriptor.colorAttachments[0].loadAction = .clear
+            bloomPassDescriptor.colorAttachments[0].storeAction = .store
+            bloomPassDescriptor.colorAttachments[0].clearColor = MTLClearColor(
+                red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0
+            )
+
+            guard let bloomEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: bloomPassDescriptor) else {
+                print("MetalView: Failed to create bloom encoder")
+                return
+            }
+
+            // Update post-process uniforms (for custom GLSL shaders)
+            if let uniformBuffer = postProcessUniformBuffer {
+                var postUniforms = PostProcessUniforms(
+                    iResolution: SIMD2<Float>(Float(drawableSize.width), Float(drawableSize.height)),
+                    iTime: Float(now - shaderStartTime)
+                )
+                memcpy(uniformBuffer.contents(), &postUniforms, MemoryLayout<PostProcessUniforms>.stride)
+                bloomEncoder.setFragmentBuffer(uniformBuffer, offset: 0, index: 0)
+            }
+
+            // Use custom GLSL shader if available, otherwise built-in bloom
+            if let customPipeline = customShaderPipeline {
+                bloomEncoder.setRenderPipelineState(customPipeline)
+            } else {
+                bloomEncoder.setRenderPipelineState(bloomPipelineState)
+            }
+
+            bloomEncoder.setFragmentTexture(offscreenTexture, index: 0)
+            // Draw fullscreen quad (6 vertices generated in shader)
+            bloomEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+
+            bloomEncoder.endEncoding()
+        }
 
         // Present the drawable
         commandBuffer.present(drawable)
@@ -604,16 +1005,384 @@ class MetalView: NSView {
         // Don't call super - we handle all keys ourselves
         // This prevents the system beep
 
-        // TODO: Translate to libvulpes key code and send
-        // let modifiers = translateModifiers(event.modifierFlags)
-        // let keyCode = translateKeyCode(event.keyCode)
-        // VulpesBridge.shared.sendKeyDown(keyCode: keyCode, modifiers: modifiers)
+        guard let chars = event.charactersIgnoringModifiers else { return }
 
-        // For now, just log
-        print("MetalView: keyDown - keyCode: \(event.keyCode), characters: \(event.characters ?? "")")
+        switch chars {
+        case "j":
+            scrollBy(lines: 1)
+            lastKeyChar = ""
+        case "k":
+            scrollBy(lines: -1)
+            lastKeyChar = ""
+        case "d":
+            // Half page down (Ctrl+D style)
+            scrollBy(lines: 10)
+            lastKeyChar = ""
+        case "u":
+            // Half page up (Ctrl+U style)
+            scrollBy(lines: -10)
+            lastKeyChar = ""
+        case "G":
+            // Jump to bottom
+            scrollToBottom()
+            lastKeyChar = ""
+        case "\t": // Tab
+            if event.modifierFlags.contains(.shift) {
+                cycleToPrevLink()
+            } else {
+                cycleToNextLink()
+            }
+            lastKeyChar = ""
+        case "\r": // Enter/Return
+            if focusedLinkIndex >= 0 {
+                followLink(number: focusedLinkIndex + 1)
+            }
+            lastKeyChar = ""
+        case "g":
+            // gg to jump to top
+            let now = CFAbsoluteTimeGetCurrent()
+            if lastKeyChar == "g" && (now - lastKeyTime) < 0.5 {
+                scrollToTop()
+                lastKeyChar = ""
+            } else {
+                lastKeyChar = "g"
+                lastKeyTime = now
+            }
+        default:
+            // Check for number keys 1-9 for link navigation
+            if let num = Int(chars), num >= 1 && num <= 9 {
+                followLink(number: num)
+                lastKeyChar = ""
+            } else {
+                lastKeyChar = ""
+                print("MetalView: keyDown - keyCode: \(event.keyCode), characters: \(chars)")
+            }
+        }
 
         // Request redraw after input
         needsDisplay = true
+    }
+
+    // MARK: - Scrolling
+
+    private func scrollBy(lines: Int) {
+        let delta = Float(lines) * scrollSpeed
+        scrollOffset = max(0, scrollOffset + delta)
+
+        // Clamp to content bounds
+        let maxScroll = max(0, contentHeight - Float(bounds.height) + 40)
+        scrollOffset = min(scrollOffset, maxScroll)
+
+        updateTextDisplay()
+    }
+
+    private func scrollToTop() {
+        scrollOffset = 0
+        updateTextDisplay()
+    }
+
+    private func scrollToBottom() {
+        let maxScroll = max(0, contentHeight - Float(bounds.height) + 40)
+        scrollOffset = maxScroll
+        updateTextDisplay()
+    }
+
+    // MARK: - Particle System
+
+    /// Spawn burst of particles across a rectangular area (link explosion effect)
+    private func spawnParticles(at point: CGPoint, color: SIMD3<Float>? = nil) {
+        spawnParticlesInArea(
+            minX: Float(point.x) - 5,
+            minY: Float(point.y) - 5,
+            maxX: Float(point.x) + 5,
+            maxY: Float(point.y) + 5,
+            color: color
+        )
+    }
+
+    /// Spawn particles across a link's bounding box - letters explode into particles
+    private func spawnParticlesFromLink(hitBox: LinkHitBox, color: SIMD3<Float>? = nil) {
+        // Adjust for scroll offset
+        let minY = hitBox.minY - scrollOffset
+        let maxY = hitBox.maxY - scrollOffset
+
+        spawnParticlesInArea(
+            minX: hitBox.minX,
+            minY: minY,
+            maxX: hitBox.maxX,
+            maxY: maxY,
+            color: color
+        )
+    }
+
+    /// Core particle spawning - distributes particles across rectangular area
+    private func spawnParticlesInArea(minX: Float, minY: Float, maxX: Float, maxY: Float, color: SIMD3<Float>? = nil) {
+        let scale = Float(metalLayer.contentsScale)
+
+        // Default to link blue
+        let baseColor = color ?? SIMD3<Float>(0.4, 0.6, 1.0)
+
+        // Calculate area for density-based spawning
+        let width = (maxX - minX) * scale
+        let height = (maxY - minY) * scale
+        let area = width * height
+
+        // More particles for larger links (density-based)
+        let particleCount = min(maxParticles / 4, max(particleSpawnCount, Int(area / 20)))
+
+        for _ in 0..<particleCount {
+            // Random position within the link bounds
+            let x = Float.random(in: minX...maxX) * scale
+            let y = Float.random(in: minY...maxY) * scale
+
+            // Explode outward from the link - velocity based on position
+            let centerX = (minX + maxX) / 2 * scale
+            let centerY = (minY + maxY) / 2 * scale
+
+            // Direction away from center
+            let dx = x - centerX
+            let dy = y - centerY
+            let dist = sqrt(dx * dx + dy * dy) + 0.1
+
+            // Slower, more graceful velocity
+            let speed = Float.random(in: 60...180) * scale
+            let vx = (dx / dist) * speed + Float.random(in: -30...30) * scale
+            let vy = (dy / dist) * speed + Float.random(in: -40...40) * scale
+
+            // Always 1px dots
+            let size: Float = 1.0 * scale
+            // Longer lifetime for graceful fade
+            let maxLife = Float.random(in: 0.6...1.4)
+
+            // Color variation
+            let colorVariation: Float = 0.12
+            let r = baseColor.x + Float.random(in: -colorVariation...colorVariation)
+            let g = baseColor.y + Float.random(in: -colorVariation...colorVariation)
+            let b = baseColor.z + Float.random(in: -colorVariation...colorVariation)
+
+            let particle = Particle(
+                x: x,
+                y: y,
+                vx: vx,
+                vy: vy,
+                life: 1.0,
+                maxLife: maxLife,
+                size: size,
+                r: min(1, max(0, r)),
+                g: min(1, max(0, g)),
+                b: min(1, max(0, b))
+            )
+
+            // Maintain max particle count
+            if particles.count >= maxParticles {
+                particles.removeFirst()
+            }
+            particles.append(particle)
+        }
+    }
+
+    /// Update particle physics and remove dead particles
+    private func updateParticles(deltaTime: Float) {
+        // Gentler gravity for more floaty feel
+        let gravity: Float = 40.0 * Float(metalLayer.contentsScale)
+        // More drag for graceful slowdown
+        let drag: Float = 0.96
+
+        particles = particles.compactMap { p in
+            var particle = p
+
+            // Update velocity (gentle gravity + smooth drag)
+            particle.vy += gravity * deltaTime
+            particle.vx *= pow(drag, deltaTime * 60)  // Frame-rate independent drag
+            particle.vy *= pow(drag, deltaTime * 60)
+
+            // Update position
+            particle.x += particle.vx * deltaTime
+            particle.y += particle.vy * deltaTime
+
+            // Slower life decay for longer-lasting particles
+            particle.life -= deltaTime / particle.maxLife
+
+            // Remove dead particles
+            if particle.life <= 0 {
+                return nil
+            }
+            return particle
+        }
+    }
+
+    /// Update glow animation with easing
+    private func updateGlowAnimation(deltaTime: Float) {
+        let diff = targetGlowIntensity - glowIntensity
+
+        if abs(diff) < 0.001 {
+            glowIntensity = targetGlowIntensity
+            return
+        }
+
+        // Different speeds for fade-in vs fade-out (inertia on fade-out)
+        let speed = diff > 0 ? glowFadeInSpeed : glowFadeOutSpeed
+
+        // Quad ease-out for smooth deceleration
+        let t = 1.0 - pow(1.0 - min(deltaTime * speed, 1.0), 2.0)
+        glowIntensity += diff * Float(t)
+
+        // Clamp
+        glowIntensity = max(0, min(1, glowIntensity))
+    }
+
+    /// Build vertex buffer for all active particles
+    private func buildParticleVertices() -> (MTLBuffer?, Int) {
+        guard !particles.isEmpty else { return (nil, 0) }
+
+        var vertices: [Vertex] = []
+        vertices.reserveCapacity(particles.count * 6)
+
+        for p in particles {
+            // Fade alpha as life decreases
+            let alpha = p.life * 0.8
+
+            // Shrink slightly as particle dies
+            let sizeMultiplier = 0.5 + (p.life * 0.5)
+            let halfSize = p.size * sizeMultiplier
+
+            let x1 = p.x - halfSize
+            let y1 = p.y - halfSize
+            let x2 = p.x + halfSize
+            let y2 = p.y + halfSize
+
+            let color = SIMD4<Float>(p.r, p.g, p.b, alpha)
+
+            // Two triangles for quad - use texCoords for soft edge calculation in shader
+            vertices.append(Vertex(position: SIMD2<Float>(x1, y1), texCoord: SIMD2<Float>(0, 0), color: color))
+            vertices.append(Vertex(position: SIMD2<Float>(x2, y1), texCoord: SIMD2<Float>(1, 0), color: color))
+            vertices.append(Vertex(position: SIMD2<Float>(x1, y2), texCoord: SIMD2<Float>(0, 1), color: color))
+            vertices.append(Vertex(position: SIMD2<Float>(x2, y1), texCoord: SIMD2<Float>(1, 0), color: color))
+            vertices.append(Vertex(position: SIMD2<Float>(x2, y2), texCoord: SIMD2<Float>(1, 1), color: color))
+            vertices.append(Vertex(position: SIMD2<Float>(x1, y2), texCoord: SIMD2<Float>(0, 1), color: color))
+        }
+
+        let buffer = device.makeBuffer(
+            bytes: vertices,
+            length: MemoryLayout<Vertex>.stride * vertices.count,
+            options: .storageModeShared
+        )
+        buffer?.label = "Particle Vertices"
+
+        return (buffer, vertices.count)
+    }
+
+    /// Build glow quad for hovered link with animated intensity
+    private func buildGlowVertices() -> (MTLBuffer?, Int) {
+        // Show glow if we have intensity (allows fade-out after mouse leaves)
+        guard glowIntensity > 0.01, hoveredLinkIndex >= 0, hoveredLinkIndex < linkHitBoxes.count else {
+            return (nil, 0)
+        }
+
+        let hitBox = linkHitBoxes[hoveredLinkIndex]
+        let scale = Float(metalLayer.contentsScale)
+
+        // Expand hitbox for glow effect - grows with intensity for "bloom" feel
+        let baseGlowPadding: Float = 8.0 * scale
+        let maxGlowPadding: Float = 16.0 * scale
+        let glowPadding = baseGlowPadding + (maxGlowPadding - baseGlowPadding) * glowIntensity
+
+        let x1 = hitBox.minX * scale - glowPadding
+        let y1 = (hitBox.minY - scrollOffset) * scale - glowPadding
+        let x2 = hitBox.maxX * scale + glowPadding
+        let y2 = (hitBox.maxY - scrollOffset) * scale + glowPadding
+
+        // Glow color - intensity affects alpha with eased curve
+        let easedIntensity = glowIntensity * glowIntensity  // Quad ease for smoother ramp
+        let color = SIMD4<Float>(0.3, 0.5, 1.0, 0.35 * easedIntensity)
+
+        var vertices: [Vertex] = []
+        vertices.append(Vertex(position: SIMD2<Float>(x1, y1), texCoord: SIMD2<Float>(0, 0), color: color))
+        vertices.append(Vertex(position: SIMD2<Float>(x2, y1), texCoord: SIMD2<Float>(1, 0), color: color))
+        vertices.append(Vertex(position: SIMD2<Float>(x1, y2), texCoord: SIMD2<Float>(0, 1), color: color))
+        vertices.append(Vertex(position: SIMD2<Float>(x2, y1), texCoord: SIMD2<Float>(1, 0), color: color))
+        vertices.append(Vertex(position: SIMD2<Float>(x2, y2), texCoord: SIMD2<Float>(1, 1), color: color))
+        vertices.append(Vertex(position: SIMD2<Float>(x1, y2), texCoord: SIMD2<Float>(0, 1), color: color))
+
+        let buffer = device.makeBuffer(
+            bytes: vertices,
+            length: MemoryLayout<Vertex>.stride * vertices.count,
+            options: .storageModeShared
+        )
+        buffer?.label = "Glow Vertices"
+
+        return (buffer, vertices.count)
+    }
+
+    // MARK: - Link Navigation
+
+    /// Focus the first link (called when Tab from URL bar)
+    func focusFirstLink() {
+        guard !extractedLinks.isEmpty else { return }
+        focusedLinkIndex = 0
+        updateTextDisplay()
+    }
+
+    /// Focus the last link (called when Shift+Tab from URL bar)
+    func focusLastLink() {
+        guard !extractedLinks.isEmpty else { return }
+        focusedLinkIndex = extractedLinks.count - 1
+        updateTextDisplay()
+    }
+
+    private func cycleToNextLink() {
+        guard !extractedLinks.isEmpty else { return }
+
+        focusedLinkIndex += 1
+        if focusedLinkIndex >= extractedLinks.count {
+            // Wrap to URL bar
+            focusedLinkIndex = -1
+            onRequestURLBarFocus?()
+            return
+        }
+
+        updateTextDisplay()
+    }
+
+    private func cycleToPrevLink() {
+        guard !extractedLinks.isEmpty else { return }
+
+        focusedLinkIndex -= 1
+        if focusedLinkIndex < -1 {
+            focusedLinkIndex = extractedLinks.count - 1
+        } else if focusedLinkIndex == -1 {
+            onRequestURLBarFocus?()
+            return
+        }
+
+        updateTextDisplay()
+    }
+
+    private func followLink(number: Int) {
+        let index = number - 1  // Links are 1-indexed
+        guard index >= 0 && index < extractedLinks.count else {
+            print("MetalView: No link \(number) (have \(extractedLinks.count) links)")
+            return
+        }
+
+        // Spawn particles from the link (if we have a hit box for it)
+        if let hitBox = linkHitBoxes.first(where: { $0.linkIndex == index }) {
+            spawnParticlesFromLink(hitBox: hitBox, color: SIMD3<Float>(0.4, 0.6, 1.0))
+        }
+
+        var url = extractedLinks[index]
+
+        // Handle relative URLs
+        if url.hasPrefix("/") {
+            // Construct absolute URL from current page
+            if let currentURLObj = URL(string: currentURL),
+               let baseURL = URL(string: "/", relativeTo: currentURLObj) {
+                url = baseURL.absoluteString.dropLast() + url
+            }
+        }
+
+        print("MetalView: Following link \(number): \(url)")
+        loadURL(url)
     }
 
     override func keyUp(with event: NSEvent) {
@@ -634,19 +1403,99 @@ class MetalView: NSView {
     // - Scrolling (trackpad)
 
     override func mouseDown(with event: NSEvent) {
-        // Convert to view coordinates
+        // Convert to view coordinates (AppKit has origin at bottom-left)
         let point = convert(event.locationInWindow, from: nil)
 
-        // TODO: Send to libvulpes for hit testing
-        // VulpesBridge.shared.sendMouseDown(x: Float(point.x), y: Float(point.y))
+        // Convert to top-left origin (our rendering coordinate system)
+        let x = Float(point.x)
+        let y = Float(bounds.height - point.y)
 
-        print("MetalView: mouseDown at \(point)")
+        // Add scroll offset to get content-space Y (hit boxes are stored in content space)
+        let contentY = y + scrollOffset
+
+        // Check if click is on a link
+        if let hitBox = linkHitBoxes.first(where: { box in
+            x >= box.minX && x <= box.maxX && contentY >= box.minY && contentY <= box.maxY
+        }) {
+            // Focus and follow the link (followLink handles particles now)
+            focusedLinkIndex = hitBox.linkIndex
+            updateTextDisplay()
+            followLink(number: hitBox.linkIndex + 1)
+            return
+        }
+
+        // No particles for non-link clicks - keep it clean
+        // Take focus from URL bar
+        window?.makeFirstResponder(self)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let x = Float(point.x)
+        let y = Float(bounds.height - point.y)
+
+        // Add scroll offset to get content-space Y (hit boxes are stored in content space)
+        let contentY = y + scrollOffset
+
+        // Find which link we're hovering over (if any)
+        let newHoveredIndex = linkHitBoxes.firstIndex { box in
+            x >= box.minX && x <= box.maxX && contentY >= box.minY && contentY <= box.maxY
+        }.map { linkHitBoxes[$0].linkIndex } ?? -1
+
+        // Update hovered link and animate glow
+        if newHoveredIndex != hoveredLinkIndex {
+            // Only update hoveredLinkIndex when entering a new link
+            // Keep old index during fade-out so glow stays on correct link
+            if newHoveredIndex >= 0 {
+                hoveredLinkIndex = newHoveredIndex
+            }
+        }
+
+        // Set target glow intensity (animation will interpolate)
+        targetGlowIntensity = newHoveredIndex >= 0 ? 1.0 : 0.0
+
+        // Update cursor
+        if newHoveredIndex >= 0 {
+            NSCursor.pointingHand.set()
+        } else {
+            NSCursor.arrow.set()
+        }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        // Remove old tracking areas
+        for area in trackingAreas {
+            removeTrackingArea(area)
+        }
+        // Add tracking area for mouse moved events
+        let trackingArea = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(trackingArea)
     }
 
     override func scrollWheel(with event: NSEvent) {
-        // TODO: Send scroll delta to libvulpes
-        // VulpesBridge.shared.sendScroll(deltaX: Float(event.scrollingDeltaX),
-        //                                 deltaY: Float(event.scrollingDeltaY))
+        // Handle trackpad and mouse wheel scrolling
+        var deltaY = Float(event.scrollingDeltaY)
+
+        // For trackpad momentum scrolling, the values are already in points
+        // For mouse wheel, they're in lines - scale up
+        if !event.hasPreciseScrollingDeltas {
+            deltaY *= scrollSpeed
+        }
+
+        // Apply scroll (natural scrolling: positive delta = scroll up = content goes down)
+        scrollOffset = max(0, scrollOffset - deltaY)
+
+        // Clamp to content bounds
+        let maxScroll = max(0, contentHeight - Float(bounds.height) + 40)
+        scrollOffset = min(scrollOffset, maxScroll)
+
+        updateTextDisplay()
     }
 
     // MARK: - Text Input Client

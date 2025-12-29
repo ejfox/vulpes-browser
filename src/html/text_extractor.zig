@@ -20,6 +20,16 @@ const MAX_LINKS = 99;
 /// These are parsed by Swift to apply blue color
 const LINK_START: u8 = 0x01; // SOH - Start of Heading
 const LINK_END: u8 = 0x02; // STX - Start of Text
+const PRE_START: u8 = 0x03; // ETX - End of Text
+const PRE_END: u8 = 0x04; // EOT - End of Transmission
+const EMPH_START: u8 = 0x11; // DC1 - Device Control 1
+const EMPH_END: u8 = 0x12; // DC2 - Device Control 2
+const STRONG_START: u8 = 0x13; // DC3 - Device Control 3
+const STRONG_END: u8 = 0x14; // DC4 - Device Control 4
+const CODE_START: u8 = 0x15; // NAK - Negative Acknowledge
+const CODE_END: u8 = 0x16; // SYN - Synchronous Idle
+const QUOTE_START: u8 = 0x17; // ETB - End of Transmission Block
+const QUOTE_END: u8 = 0x18; // CAN - Cancel
 
 /// Tags whose content should be completely skipped
 const skip_tags = [_][]const u8{
@@ -45,11 +55,7 @@ const block_tags = [_][]const u8{
     "h4",
     "h5",
     "h6",
-    "li",
     "tr",
-    "hr",
-    "blockquote",
-    "pre",
     "section",
     "article",
     "header",
@@ -98,11 +104,32 @@ pub fn extractText(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
                         in_skip_tag = null;
                     }
                 } else {
-                    if (std.ascii.eqlIgnoreCase(tag_name, "pre")) {
-                        in_pre = false;
-                        try appendNewlines(allocator, &result, 2);
-                        last_was_space = true;
+                if (std.ascii.eqlIgnoreCase(tag_name, "pre")) {
+                    if (in_pre) {
+                        try result.append(allocator, PRE_END);
                     }
+                    in_pre = false;
+                    try appendNewlines(allocator, &result, 2);
+                    last_was_space = true;
+                }
+
+                if (std.ascii.eqlIgnoreCase(tag_name, "blockquote")) {
+                    try result.append(allocator, QUOTE_END);
+                    try appendNewlines(allocator, &result, 2);
+                    last_was_space = true;
+                }
+
+                if (std.ascii.eqlIgnoreCase(tag_name, "em") or std.ascii.eqlIgnoreCase(tag_name, "i")) {
+                    try result.append(allocator, EMPH_END);
+                }
+
+                if (std.ascii.eqlIgnoreCase(tag_name, "strong") or std.ascii.eqlIgnoreCase(tag_name, "b")) {
+                    try result.append(allocator, STRONG_END);
+                }
+
+                if (std.ascii.eqlIgnoreCase(tag_name, "code")) {
+                    try result.append(allocator, CODE_END);
+                }
 
                     if (std.ascii.eqlIgnoreCase(tag_name, "ul") or std.ascii.eqlIgnoreCase(tag_name, "ol")) {
                         if (list_depth > 0) list_depth -= 1;
@@ -154,7 +181,26 @@ pub fn extractText(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
                 if (std.ascii.eqlIgnoreCase(tag_name, "pre")) {
                     in_pre = true;
                     try appendNewlines(allocator, &result, 2);
+                    try result.append(allocator, PRE_START);
                     last_was_space = true;
+                }
+
+                if (std.ascii.eqlIgnoreCase(tag_name, "blockquote")) {
+                    try appendNewlines(allocator, &result, 2);
+                    try result.append(allocator, QUOTE_START);
+                    last_was_space = true;
+                }
+
+                if (std.ascii.eqlIgnoreCase(tag_name, "em") or std.ascii.eqlIgnoreCase(tag_name, "i")) {
+                    try result.append(allocator, EMPH_START);
+                }
+
+                if (std.ascii.eqlIgnoreCase(tag_name, "strong") or std.ascii.eqlIgnoreCase(tag_name, "b")) {
+                    try result.append(allocator, STRONG_START);
+                }
+
+                if (std.ascii.eqlIgnoreCase(tag_name, "code")) {
+                    try result.append(allocator, CODE_START);
                 }
 
                 if (std.ascii.eqlIgnoreCase(tag_name, "ul") or std.ascii.eqlIgnoreCase(tag_name, "ol")) {
@@ -165,7 +211,8 @@ pub fn extractText(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
 
                 if (std.ascii.eqlIgnoreCase(tag_name, "li")) {
                     try appendNewlines(allocator, &result, 1);
-                    for (0..list_depth) |_| {
+                    const indent_levels: u8 = if (list_depth > 1) list_depth - 1 else 0;
+                    for (0..indent_levels) |_| {
                         try result.appendSlice(allocator, "  ");
                     }
                     try result.appendSlice(allocator, "- ");
@@ -391,8 +438,6 @@ fn blockSpacing(name: []const u8) u8 {
         std.ascii.eqlIgnoreCase(name, "h4") or
         std.ascii.eqlIgnoreCase(name, "h5") or
         std.ascii.eqlIgnoreCase(name, "h6") or
-        std.ascii.eqlIgnoreCase(name, "blockquote") or
-        std.ascii.eqlIgnoreCase(name, "pre") or
         std.ascii.eqlIgnoreCase(name, "section") or
         std.ascii.eqlIgnoreCase(name, "article") or
         std.ascii.eqlIgnoreCase(name, "header") or
@@ -523,4 +568,55 @@ test "multiple links numbered correctly" {
 
     try std.testing.expect(std.mem.indexOf(u8, text, "[1]") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "[2]") != null);
+}
+
+test "list items render bullets" {
+    const html = "<ul><li>One</li><li>Two</li></ul>";
+    const text = try extractText(std.testing.allocator, html);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expectEqualStrings("- One\n- Two", text);
+}
+
+test "pre preserves whitespace" {
+    const html = "<pre>line 1\n  line 2</pre>";
+    const text = try extractText(std.testing.allocator, html);
+    defer std.testing.allocator.free(text);
+
+    const expected = &[_]u8{ PRE_START, 'l', 'i', 'n', 'e', ' ', '1', '\n', ' ', ' ', 'l', 'i', 'n', 'e', ' ', '2', PRE_END };
+    try std.testing.expectEqualStrings(expected, text);
+}
+
+test "emphasis markers" {
+    const html = "<p><em>Hi</em> <strong>There</strong></p>";
+    const text = try extractText(std.testing.allocator, html);
+    defer std.testing.allocator.free(text);
+
+    const expected = &[_]u8{
+        EMPH_START, 'H', 'i', EMPH_END, ' ',
+        STRONG_START, 'T', 'h', 'e', 'r', 'e', STRONG_END,
+    };
+    try std.testing.expectEqualStrings(expected, text);
+}
+
+test "code markers" {
+    const html = "<p>Use <code>curl</code> here</p>";
+    const text = try extractText(std.testing.allocator, html);
+    defer std.testing.allocator.free(text);
+
+    const expected = &[_]u8{
+        'U', 's', 'e', ' ',
+        CODE_START, 'c', 'u', 'r', 'l', CODE_END, ' ',
+        'h', 'e', 'r', 'e',
+    };
+    try std.testing.expectEqualStrings(expected, text);
+}
+
+test "blockquote markers" {
+    const html = "<blockquote>Quote</blockquote>";
+    const text = try extractText(std.testing.allocator, html);
+    defer std.testing.allocator.free(text);
+
+    const expected = &[_]u8{ QUOTE_START, 'Q', 'u', 'o', 't', 'e', QUOTE_END };
+    try std.testing.expectEqualStrings(expected, text);
 }

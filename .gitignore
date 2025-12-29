@@ -1,0 +1,12 @@
+# Zig
+.zig-cache/
+zig-out/
+
+# Xcode
+*.xcodeproj/
+xcuserdata/
+DerivedData/
+*.xcworkspace/
+
+# macOS
+.DS_Store

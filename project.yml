@@ -1,0 +1,61 @@
+name: Vulpes
+options:
+  bundleIdPrefix: com.vulpes
+  deploymentTarget:
+    macOS: "14.0"
+  xcodeVersion: "15.0"
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    # Link to libvulpes from Zig build
+    LIBRARY_SEARCH_PATHS: "$(PROJECT_DIR)/zig-out/lib"
+    # Header search for vulpes.h
+    HEADER_SEARCH_PATHS: "$(PROJECT_DIR)/zig-out/include"
+    # Enable Metal
+    MTL_ENABLE_DEBUG_INFO: "INCLUDE_SOURCE"
+
+targets:
+  Vulpes:
+    type: application
+    platform: macOS
+    sources:
+      - path: app
+        excludes:
+          - "*.md"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.vulpes.browser
+        PRODUCT_NAME: Vulpes
+        INFOPLIST_FILE: app/Info.plist
+        # C/Zig interop
+        SWIFT_OBJC_BRIDGING_HEADER: app/Vulpes-Bridging-Header.h
+        # Link libvulpes and system frameworks
+        OTHER_LDFLAGS:
+          - "-lvulpes"
+          - "-framework Metal"
+          - "-framework MetalKit"
+          - "-framework AppKit"
+          - "-framework QuartzCore"
+          - "-framework CoreText"
+          - "-framework Security"
+          - "-framework CoreFoundation"
+        # App category
+        LSApplicationCategoryType: public.app-category.productivity
+    info:
+      path: app/Info.plist
+      properties:
+        CFBundleName: Vulpes
+        CFBundleDisplayName: Vulpes Browser
+        CFBundleIdentifier: $(PRODUCT_BUNDLE_IDENTIFIER)
+        CFBundleVersion: "1"
+        CFBundleShortVersionString: "0.1.0"
+        CFBundlePackageType: APPL
+        CFBundleExecutable: $(EXECUTABLE_NAME)
+        LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        NSPrincipalClass: NSApplication
+        NSHighResolutionCapable: true
+        # Sandbox disabled for now (network access, etc.)
+        # Enable in production

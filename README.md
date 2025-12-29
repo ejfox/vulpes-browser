@@ -26,13 +26,25 @@ FEATURES
 --------
 - HTTP/HTTPS with TLS
 - gzip/deflate decompression
-- HTML text extraction
-- Metal GPU rendering
-- 60fps glyph atlas
+- HTML text extraction with link parsing
+- Metal GPU rendering with glyph atlas
+- Vim keys: j/k scroll, d/u half-page, G/gg top/bottom
+- Back/forward history with b/f
+- Numbered link navigation (1-9)
+- GLSL shaders (Ghostty/Shadertoy compatible)
+- Page transition effects
+- Error shaders for 404/500
+- Config file at ~/.config/vulpes/config
+
+NOT YET
+-------
+- JavaScript
+- CSS layout
+- Images
+- Forms
 
 NO
 --
-- JavaScript
 - Ads
 - Tracking
 

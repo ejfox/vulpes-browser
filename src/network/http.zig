@@ -136,14 +136,16 @@ pub const Client = struct {
         var response = req.receiveHead(&redirect_buffer) catch return HttpError.InvalidResponse;
 
         // Read response body with decompression support
-        var transfer_buffer: [64]u8 = undefined;
+        // Use larger buffers for reliable decompression
+        var transfer_buffer: [16 * 1024]u8 = undefined;
         var decompress: http.Decompress = undefined;
 
         // Allocate decompression buffer based on content encoding
+        // Use 2x the standard window size to avoid edge cases
         const decompress_buffer: []u8 = switch (response.head.content_encoding) {
             .identity => &.{},
-            .zstd => self.allocator.alloc(u8, std.compress.zstd.default_window_len) catch return HttpError.OutOfMemory,
-            .deflate, .gzip => self.allocator.alloc(u8, std.compress.flate.max_window_len) catch return HttpError.OutOfMemory,
+            .zstd => self.allocator.alloc(u8, std.compress.zstd.default_window_len * 2) catch return HttpError.OutOfMemory,
+            .deflate, .gzip => self.allocator.alloc(u8, std.compress.flate.max_window_len * 2) catch return HttpError.OutOfMemory,
             .compress => return HttpError.InvalidResponse,
         };
         defer if (decompress_buffer.len > 0) self.allocator.free(decompress_buffer);

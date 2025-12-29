@@ -270,6 +270,22 @@ class MetalView: NSView {
         }
     }
 
+    /// Trigger a page transition effect using TransitionManager
+    private func triggerPageTransition() {
+        guard let library = device.makeDefaultLibrary(),
+              let vertexFunction = library.makeFunction(name: "vertexShaderFullscreen") else {
+            return
+        }
+
+        TransitionManager.shared.trigger(
+            device: device,
+            vertexFunction: vertexFunction
+        )
+
+        // Keep rendering during transition
+        needsDisplay = true
+    }
+
     private func setupVertexDescriptor() {
         vertexDescriptor = MTLVertexDescriptor()
 
@@ -500,6 +516,9 @@ class MetalView: NSView {
 
     /// Load a URL and display extracted text
     func loadURL(_ url: String) {
+        // Trigger transition effect
+        triggerPageTransition()
+
         currentURL = url
         scrollOffset = 0  // Reset scroll position for new page
         focusedLinkIndex = -1  // Reset link focus
@@ -570,25 +589,43 @@ class MetalView: NSView {
         let font = CTFontCreateWithName("SF Pro Text" as CFString, fontSize, nil)
         let lineHeight: Float = Float(fontSize * 1.4)
 
-        // Use first 2000 chars to avoid huge vertex buffers
-        let text = String(displayedText.prefix(2000))
+        let text = displayedText
         let chars = Array(text.utf16)
         guard !chars.isEmpty else {
             textVertexCount = 0
             return
         }
 
-        var glyphs = [CGGlyph](repeating: 0, count: chars.count)
+        let monoFont = CTFontCreateWithName("SF Mono" as CFString, fontSize, nil)
+
+        var glyphsNormal = [CGGlyph](repeating: 0, count: chars.count)
+        var glyphsMono = [CGGlyph](repeating: 0, count: chars.count)
         // Note: mapped may be false if some chars (like control chars) can't be mapped
         // We continue anyway and skip unmappable glyphs
-        _ = CTFontGetGlyphsForCharacters(font, chars, &glyphs, chars.count)
+        _ = CTFontGetGlyphsForCharacters(font, chars, &glyphsNormal, chars.count)
+        _ = CTFontGetGlyphsForCharacters(monoFont, chars, &glyphsMono, chars.count)
+
+        let spaceChar: [UniChar] = [0x0020]
+        var normalSpaceGlyph: CGGlyph = 0
+        var monoSpaceGlyph: CGGlyph = 0
+        _ = CTFontGetGlyphsForCharacters(font, spaceChar, &normalSpaceGlyph, 1)
+        _ = CTFontGetGlyphsForCharacters(monoFont, spaceChar, &monoSpaceGlyph, 1)
 
         var vertices: [Vertex] = []
-        vertices.reserveCapacity(glyphs.count * 6)
+        vertices.reserveCapacity(chars.count * 6)
 
         let margin: Float = Float(20.0 * scale)
+        let quoteIndent: Float = Float(24.0 * scale)
         let maxWidth: Float = Float(bounds.width * scale) - margin * 2
-        var penX: Float = margin
+        var quoteDepth: Int = 0
+        func lineStartX() -> Float {
+            margin + quoteIndent * Float(quoteDepth)
+        }
+        func lineMaxX() -> Float {
+            let maxX = maxWidth - quoteIndent * Float(quoteDepth)
+            return max(maxX, lineStartX() + 1.0)
+        }
+        var penX: Float = lineStartX()
         var penY: Float = margin + Float(fontSize)
 
         // Apply scroll offset (negative = content moves up)
@@ -605,57 +642,53 @@ class MetalView: NSView {
         linkHitBoxes = []
         var currentLinkHitBox: LinkHitBox? = nil
 
-        for (i, glyph) in glyphs.enumerated() {
-            // Handle control characters for link styling
-            if chars[i] == 0x0001 { // LINK_START
-                currentLinkIndex += 1
-                if currentLinkIndex == focusedLinkIndex {
-                    currentColor = focusedLinkColor
-                } else {
-                    currentColor = linkColor
-                }
-                // Start tracking hit box for this link
-                currentLinkHitBox = LinkHitBox(
-                    linkIndex: currentLinkIndex,
-                    minX: Float.greatestFiniteMagnitude,
-                    minY: Float.greatestFiniteMagnitude,
-                    maxX: -Float.greatestFiniteMagnitude,
-                    maxY: -Float.greatestFiniteMagnitude
+        let linkStart: UInt16 = 0x0001
+        let linkEnd: UInt16 = 0x0002
+        let preStart: UInt16 = 0x0003
+        let preEnd: UInt16 = 0x0004
+        let emphStart: UInt16 = 0x0011
+        let emphEnd: UInt16 = 0x0012
+        let strongStart: UInt16 = 0x0013
+        let strongEnd: UInt16 = 0x0014
+        let codeStart: UInt16 = 0x0015
+        let codeEnd: UInt16 = 0x0016
+        let quoteStart: UInt16 = 0x0017
+        let quoteEnd: UInt16 = 0x0018
+
+        var inPre = false
+        var inLink = false
+        var inEmphasis = false
+        var inStrong = false
+        var inCode = false
+        var pendingEntries: [GlyphAtlas.GlyphEntry] = []
+        pendingEntries.reserveCapacity(32)
+        var pendingWidth: Float = 0
+
+        func updateCurrentColor() {
+            var base = inLink ? linkColor : normalColor
+            if inLink && currentLinkIndex == focusedLinkIndex {
+                base = focusedLinkColor
+            }
+
+            if inStrong {
+                base = SIMD4<Float>(
+                    min(base.x * 1.15, 1.0),
+                    min(base.y * 1.15, 1.0),
+                    min(base.z * 1.15, 1.0),
+                    base.w
                 )
-                continue
             }
-            if chars[i] == 0x0002 { // LINK_END
-                currentColor = normalColor
-                // Save hit box if we have one
-                if var hitBox = currentLinkHitBox {
-                    // Convert from pixels to points
-                    // Keep in CONTENT SPACE (don't add scrollOffset)
-                    // Mouse coords will be converted to content space for comparison
-                    hitBox.minX /= Float(scale)
-                    hitBox.minY /= Float(scale)
-                    hitBox.maxX /= Float(scale)
-                    hitBox.maxY /= Float(scale)
-                    linkHitBoxes.append(hitBox)
-                }
-                currentLinkHitBox = nil
-                continue
+            if inEmphasis {
+                base = SIMD4<Float>(base.x * 0.9, base.y * 0.9, base.z * 0.9, base.w)
+            }
+            if inCode {
+                base = SIMD4<Float>(base.x * 0.95, base.y * 0.95, base.z * 0.95, base.w)
             }
 
-            // Handle newlines
-            if chars[i] == 0x000A { // newline
-                penX = margin
-                penY += lineHeight
-                continue
-            }
+            currentColor = base
+        }
 
-            guard let entry = atlas.entry(for: glyph, font: font) else { continue }
-
-            // Word wrap
-            if penX + Float(entry.advance) > maxWidth {
-                penX = margin
-                penY += lineHeight
-            }
-
+        func appendGlyph(_ entry: GlyphAtlas.GlyphEntry, color: SIMD4<Float>) {
             // Position glyph relative to baseline (penY)
             // bearing.y is offset from baseline to bottom of glyph (negative for descenders)
             // In Y-down coords: top = baseline - (bearing.y + height), bottom = baseline - bearing.y
@@ -669,12 +702,12 @@ class MetalView: NSView {
             let v0 = Float(entry.uvRect.maxY)
             let v1 = Float(entry.uvRect.minY)
 
-            vertices.append(Vertex(position: SIMD2<Float>(x1, y1), texCoord: SIMD2<Float>(u0, v0), color: currentColor))
-            vertices.append(Vertex(position: SIMD2<Float>(x2, y1), texCoord: SIMD2<Float>(u1, v0), color: currentColor))
-            vertices.append(Vertex(position: SIMD2<Float>(x1, y2), texCoord: SIMD2<Float>(u0, v1), color: currentColor))
-            vertices.append(Vertex(position: SIMD2<Float>(x2, y1), texCoord: SIMD2<Float>(u1, v0), color: currentColor))
-            vertices.append(Vertex(position: SIMD2<Float>(x2, y2), texCoord: SIMD2<Float>(u1, v1), color: currentColor))
-            vertices.append(Vertex(position: SIMD2<Float>(x1, y2), texCoord: SIMD2<Float>(u0, v1), color: currentColor))
+            vertices.append(Vertex(position: SIMD2<Float>(x1, y1), texCoord: SIMD2<Float>(u0, v0), color: color))
+            vertices.append(Vertex(position: SIMD2<Float>(x2, y1), texCoord: SIMD2<Float>(u1, v0), color: color))
+            vertices.append(Vertex(position: SIMD2<Float>(x1, y2), texCoord: SIMD2<Float>(u0, v1), color: color))
+            vertices.append(Vertex(position: SIMD2<Float>(x2, y1), texCoord: SIMD2<Float>(u1, v0), color: color))
+            vertices.append(Vertex(position: SIMD2<Float>(x2, y2), texCoord: SIMD2<Float>(u1, v1), color: color))
+            vertices.append(Vertex(position: SIMD2<Float>(x1, y2), texCoord: SIMD2<Float>(u0, v1), color: color))
 
             // Expand link hit box if we're in a link
             if currentLinkHitBox != nil {
@@ -692,6 +725,169 @@ class MetalView: NSView {
 
             penX += Float(entry.advance)
         }
+
+        func flushPendingWord() {
+            guard pendingWidth > 0 else { return }
+
+            if penX + pendingWidth > lineMaxX() && penX > lineStartX() {
+                penX = lineStartX()
+                penY += lineHeight
+            }
+
+            for entry in pendingEntries {
+                appendGlyph(entry, color: currentColor)
+            }
+
+            pendingEntries.removeAll(keepingCapacity: true)
+            pendingWidth = 0
+        }
+
+        for i in 0..<chars.count {
+            let char = chars[i]
+
+            if char == linkStart {
+                flushPendingWord()
+                currentLinkIndex += 1
+                inLink = true
+                updateCurrentColor()
+                // Start tracking hit box for this link
+                currentLinkHitBox = LinkHitBox(
+                    linkIndex: currentLinkIndex,
+                    minX: Float.greatestFiniteMagnitude,
+                    minY: Float.greatestFiniteMagnitude,
+                    maxX: -Float.greatestFiniteMagnitude,
+                    maxY: -Float.greatestFiniteMagnitude
+                )
+                continue
+            }
+            if char == linkEnd {
+                flushPendingWord()
+                inLink = false
+                updateCurrentColor()
+                // Save hit box if we have one
+                if var hitBox = currentLinkHitBox {
+                    // Convert from pixels to points
+                    // Keep in CONTENT SPACE (don't add scrollOffset)
+                    // Mouse coords will be converted to content space for comparison
+                    hitBox.minX /= Float(scale)
+                    hitBox.minY /= Float(scale)
+                    hitBox.maxX /= Float(scale)
+                    hitBox.maxY /= Float(scale)
+                    linkHitBoxes.append(hitBox)
+                }
+                currentLinkHitBox = nil
+                continue
+            }
+            if char == preStart {
+                flushPendingWord()
+                inPre = true
+                continue
+            }
+            if char == preEnd {
+                flushPendingWord()
+                inPre = false
+                continue
+            }
+            if char == emphStart {
+                flushPendingWord()
+                inEmphasis = true
+                updateCurrentColor()
+                continue
+            }
+            if char == emphEnd {
+                flushPendingWord()
+                inEmphasis = false
+                updateCurrentColor()
+                continue
+            }
+            if char == strongStart {
+                flushPendingWord()
+                inStrong = true
+                updateCurrentColor()
+                continue
+            }
+            if char == strongEnd {
+                flushPendingWord()
+                inStrong = false
+                updateCurrentColor()
+                continue
+            }
+            if char == codeStart {
+                flushPendingWord()
+                inCode = true
+                updateCurrentColor()
+                continue
+            }
+            if char == codeEnd {
+                flushPendingWord()
+                inCode = false
+                updateCurrentColor()
+                continue
+            }
+            if char == quoteStart {
+                flushPendingWord()
+                if penX != lineStartX() {
+                    penX = lineStartX()
+                    penY += lineHeight
+                }
+                quoteDepth += 1
+                penX = lineStartX()
+                continue
+            }
+            if char == quoteEnd {
+                flushPendingWord()
+                quoteDepth = max(0, quoteDepth - 1)
+                penX = lineStartX()
+                continue
+            }
+
+            // Handle newlines
+            if char == 0x000A { // newline
+                flushPendingWord()
+                penX = lineStartX()
+                penY += lineHeight
+                continue
+            }
+
+            let useMono = inPre || inCode
+            let glyph = useMono ? glyphsMono[i] : glyphsNormal[i]
+            let activeFont = useMono ? monoFont : font
+
+            if inPre {
+                if char == 0x0009 { // tab
+                    if let spaceEntry = atlas.entry(for: monoSpaceGlyph, font: monoFont) {
+                        penX += Float(spaceEntry.advance) * 4
+                    }
+                    continue
+                }
+                if char == 0x0020 { // space
+                    if let spaceEntry = atlas.entry(for: monoSpaceGlyph, font: monoFont) {
+                        penX += Float(spaceEntry.advance)
+                    }
+                    continue
+                }
+                guard let entry = atlas.entry(for: glyph, font: activeFont) else { continue }
+                appendGlyph(entry, color: currentColor)
+                continue
+            }
+
+            if char == 0x0020 || char == 0x0009 {
+                flushPendingWord()
+                if penX > lineStartX() {
+                    let spaceGlyph = useMono ? monoSpaceGlyph : normalSpaceGlyph
+                    if let spaceEntry = atlas.entry(for: spaceGlyph, font: activeFont) {
+                        penX += Float(spaceEntry.advance)
+                    }
+                }
+                continue
+            }
+
+            guard let entry = atlas.entry(for: glyph, font: activeFont) else { continue }
+            pendingEntries.append(entry)
+            pendingWidth += Float(entry.advance)
+        }
+
+        flushPendingWord()
 
         // Track content height for scroll bounds
         contentHeight = penY / Float(scale)
@@ -956,18 +1152,39 @@ class MetalView: NSView {
                 return
             }
 
-            // Update post-process uniforms (for custom GLSL shaders)
+            // Check if transition is active
+            let transitionManager = TransitionManager.shared
+            let isTransitioning = transitionManager.shouldRender()
+
+            // Update post-process uniforms
             if let uniformBuffer = postProcessUniformBuffer {
-                var postUniforms = PostProcessUniforms(
-                    iResolution: SIMD2<Float>(Float(drawableSize.width), Float(drawableSize.height)),
-                    iTime: Float(now - shaderStartTime)
-                )
+                var postUniforms: PostProcessUniforms
+
+                if isTransitioning {
+                    // Use transition-specific time (0 to 1 progress)
+                    postUniforms = PostProcessUniforms(
+                        iResolution: SIMD2<Float>(Float(drawableSize.width), Float(drawableSize.height)),
+                        iTime: transitionManager.shaderTime()
+                    )
+                    // Keep rendering during transition
+                    DispatchQueue.main.async { [weak self] in
+                        self?.needsDisplay = true
+                    }
+                } else {
+                    // Normal shader time
+                    postUniforms = PostProcessUniforms(
+                        iResolution: SIMD2<Float>(Float(drawableSize.width), Float(drawableSize.height)),
+                        iTime: Float(now - shaderStartTime)
+                    )
+                }
                 memcpy(uniformBuffer.contents(), &postUniforms, MemoryLayout<PostProcessUniforms>.stride)
                 bloomEncoder.setFragmentBuffer(uniformBuffer, offset: 0, index: 0)
             }
 
-            // Use custom GLSL shader if available, otherwise built-in bloom
-            if let customPipeline = customShaderPipeline {
+            // Select shader pipeline: transition > custom > bloom
+            if isTransitioning, let transitionPipeline = transitionManager.shaderPipeline {
+                bloomEncoder.setRenderPipelineState(transitionPipeline)
+            } else if let customPipeline = customShaderPipeline {
                 bloomEncoder.setRenderPipelineState(customPipeline)
             } else {
                 bloomEncoder.setRenderPipelineState(bloomPipelineState)
@@ -1048,6 +1265,10 @@ class MetalView: NSView {
                 lastKeyChar = "g"
                 lastKeyTime = now
             }
+        case "/":
+            // Focus URL bar (vim-style)
+            NotificationCenter.default.post(name: .focusURLBar, object: nil)
+            lastKeyChar = ""
         default:
             // Check for number keys 1-9 for link navigation
             if let num = Int(chars), num >= 1 && num <= 9 {

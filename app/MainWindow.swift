@@ -10,7 +10,7 @@
 
 import AppKit
 
-class MainWindow: NSWindow, NSTextFieldDelegate {
+class MainWindow: NSWindow, NSTextFieldDelegate, NSToolbarDelegate {
 
     // MARK: - Properties
 
@@ -19,6 +19,9 @@ class MainWindow: NSWindow, NSTextFieldDelegate {
 
     // URL bar for navigation
     private var urlBar: NSTextField!
+
+    // Toolbar item identifiers
+    private let urlBarItemIdentifier = NSToolbarItem.Identifier("urlBar")
 
     // MARK: - Initialization
 
@@ -49,7 +52,7 @@ class MainWindow: NSWindow, NSTextFieldDelegate {
 
     private func setupWindow() {
         // Window title - will eventually show current page title
-        title = "Vulpes"
+        title = ""  // Empty title since we have URL bar
 
         // Center on screen for first launch
         center()
@@ -60,15 +63,32 @@ class MainWindow: NSWindow, NSTextFieldDelegate {
         // Enable automatic content view resizing
         contentView?.autoresizingMask = [.width, .height]
 
-        // Modern appearance settings
-        titlebarAppearsTransparent = false
+        // Modern unified title bar appearance
+        titlebarAppearsTransparent = true
+        titleVisibility = .hidden
+        styleMask.insert(.fullSizeContentView)
+
+        // Frosted glass background (like Ghostty)
+        backgroundColor = .clear
+        isOpaque = false
 
         // Allow window to become key and main
         // (Important for receiving keyboard events)
         isReleasedWhenClosed = false
 
+        // Set up toolbar with URL bar
+        setupToolbar()
+
         // TODO: Consider fullscreen support
         // collectionBehavior = [.fullScreenPrimary]
+    }
+
+    private func setupToolbar() {
+        let toolbar = NSToolbar(identifier: "MainToolbar")
+        toolbar.delegate = self
+        toolbar.displayMode = .iconOnly
+        toolbar.showsBaselineSeparator = false
+        self.toolbar = toolbar
     }
 
     private func setupMetalView() {
@@ -76,50 +96,64 @@ class MainWindow: NSWindow, NSTextFieldDelegate {
             fatalError("MainWindow: contentView is nil")
         }
 
-        let urlBarHeight: CGFloat = 32
+        // Add frosted glass blur effect (like Ghostty)
+        let visualEffect = NSVisualEffectView(frame: contentView.bounds)
+        visualEffect.autoresizingMask = [.width, .height]
+        visualEffect.blendingMode = .behindWindow
+        visualEffect.material = .hudWindow  // Dark frosted glass
+        visualEffect.state = .active
+        contentView.addSubview(visualEffect)
 
-        // Create URL bar container
-        let urlBarContainer = NSView(frame: NSRect(
-            x: 0,
-            y: contentView.bounds.height - urlBarHeight,
-            width: contentView.bounds.width,
-            height: urlBarHeight
-        ))
-        urlBarContainer.autoresizingMask = [.width, .minYMargin]
-        urlBarContainer.wantsLayer = true
-        urlBarContainer.layer?.backgroundColor = NSColor(white: 0.15, alpha: 1.0).cgColor
-
-        // Create URL bar text field
-        urlBar = NSTextField(frame: NSRect(
-            x: 8,
-            y: 4,
-            width: contentView.bounds.width - 16,
-            height: 24
-        ))
-        urlBar.autoresizingMask = [.width]
-        urlBar.stringValue = "https://ejfox.com"
-        urlBar.placeholderString = "Enter URL..."
-        urlBar.bezelStyle = .roundedBezel
-        urlBar.font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
-        urlBar.focusRingType = .none
-        urlBar.delegate = self
-        urlBarContainer.addSubview(urlBar)
-
-        // Create Metal view below URL bar
-        metalView = MetalView(frame: NSRect(
-            x: 0,
-            y: 0,
-            width: contentView.bounds.width,
-            height: contentView.bounds.height - urlBarHeight
-        ))
+        // Create Metal view using full content area (toolbar is above)
+        metalView = MetalView(frame: contentView.bounds)
         metalView.autoresizingMask = [.width, .height]
 
-        // Add views to content view
+        // Add views to content view (Metal view on top of blur)
         contentView.addSubview(metalView)
-        contentView.addSubview(urlBarContainer)
 
-        // Start with URL bar focused for keyboard-first UX
-        makeFirstResponder(urlBar)
+        // Update URL bar when MetalView navigates
+        metalView.onURLChange = { [weak self] url in
+            self?.urlBar.stringValue = url
+        }
+
+        // Focus URL bar when Tab cycles past last link
+        metalView.onRequestURLBarFocus = { [weak self] in
+            self?.makeFirstResponder(self?.urlBar)
+        }
+    }
+
+    // MARK: - NSToolbarDelegate
+
+    func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
+        if itemIdentifier == urlBarItemIdentifier {
+            let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+
+            // Create URL bar
+            urlBar = NSTextField(frame: NSRect(x: 0, y: 0, width: 400, height: 24))
+            urlBar.stringValue = "https://ejfox.com"
+            urlBar.placeholderString = "Enter URL..."
+            urlBar.bezelStyle = .roundedBezel
+            urlBar.font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+            urlBar.focusRingType = .default
+            urlBar.delegate = self
+            urlBar.lineBreakMode = .byTruncatingTail
+            urlBar.cell?.truncatesLastVisibleLine = true
+
+            item.view = urlBar
+            item.minSize = NSSize(width: 200, height: 24)
+            item.maxSize = NSSize(width: 800, height: 24)
+
+            return item
+        }
+        return nil
+    }
+
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        return [.flexibleSpace, urlBarItemIdentifier, .flexibleSpace]
+    }
+
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        return [urlBarItemIdentifier, .flexibleSpace]
     }
 
     // MARK: - URL Bar Actions
@@ -140,28 +174,38 @@ class MainWindow: NSWindow, NSTextFieldDelegate {
         }
     }
 
+    // Handle Tab key in URL bar to move focus to MetalView
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(insertTab(_:)) {
+            makeFirstResponder(metalView)
+            metalView.focusFirstLink()
+            return true
+        }
+        if commandSelector == #selector(insertBacktab(_:)) {
+            makeFirstResponder(metalView)
+            metalView.focusLastLink()
+            return true
+        }
+        return false
+    }
+
     // MARK: - Keyboard Event Handling
-    //
-    // Keyboard Event Flow:
-    // 1. NSWindow receives key events
-    // 2. Events are dispatched to the first responder (MetalView)
-    // 3. MetalView converts to libvulpes key codes
-    // 4. libvulpes processes and returns render commands
-    //
-    // Note: For vim-style navigation, we need to handle:
-    // - Regular key presses (keyDown)
-    // - Key repeats (handled automatically by AppKit)
-    // - Modifier keys (flagsChanged)
-    // - Text input for search/command entry (insertText via NSTextInputClient)
-    //
-    // The MetalView should implement NSTextInputClient for proper
-    // text input handling, especially for international keyboards
-    // and IME support.
 
     override func keyDown(with event: NSEvent) {
-        // Forward to first responder (MetalView)
-        // Don't call super - we handle all keyboard input ourselves
-        // This prevents the system beep on unhandled keys
+        // Cmd+L focuses URL bar (standard browser shortcut)
+        if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers == "l" {
+            makeFirstResponder(urlBar)
+            urlBar.selectText(nil)  // Select all text
+            return
+        }
+
+        // Escape focuses MetalView (exit URL bar)
+        if event.keyCode == 53 {  // Escape key
+            makeFirstResponder(metalView)
+            return
+        }
+
+        // Forward to first responder
         if let responder = firstResponder, responder !== self {
             responder.keyDown(with: event)
         }

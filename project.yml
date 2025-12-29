@@ -28,7 +28,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.vulpes.browser
-        PRODUCT_NAME: Vulpes
+        PRODUCT_NAME: "Vulpes Browser"
         INFOPLIST_FILE: app/Info.plist
         # C/Zig interop
         SWIFT_OBJC_BRIDGING_HEADER: app/Vulpes-Bridging-Header.h
@@ -47,11 +47,11 @@ targets:
     info:
       path: app/Info.plist
       properties:
-        CFBundleName: Vulpes
+        CFBundleName: Vulpes Browser
         CFBundleDisplayName: Vulpes Browser
         CFBundleIdentifier: $(PRODUCT_BUNDLE_IDENTIFIER)
         CFBundleVersion: "1"
-        CFBundleShortVersionString: "0.1.0"
+        CFBundleShortVersionString: "0.1.0-beta.1"
         CFBundlePackageType: APPL
         CFBundleExecutable: $(EXECUTABLE_NAME)
         LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)

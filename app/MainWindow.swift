@@ -20,6 +20,24 @@ class MainWindow: NSWindow, NSTextFieldDelegate, NSToolbarDelegate {
     // URL bar for navigation
     private var urlBar: NSTextField!
 
+    // Status bar for tabs (tmux-style)
+    private var statusBar: NSVisualEffectView!
+    private var statusLabel: NSTextField!
+    private let statusBarHeight: CGFloat = 22.0
+
+    private struct BrowserTab {
+        let id: UUID
+        var url: String
+        var content: String
+        var title: String
+        var displayTitle: String
+        var scrollOffset: Float
+        var llmRequestID: UUID?
+    }
+
+    private var tabs: [BrowserTab] = []
+    private var activeTabIndex: Int = 0
+
     // Toolbar item identifiers
     private let urlBarItemIdentifier = NSToolbarItem.Identifier("urlBar")
 
@@ -104,16 +122,51 @@ class MainWindow: NSWindow, NSTextFieldDelegate, NSToolbarDelegate {
         visualEffect.state = .active
         contentView.addSubview(visualEffect)
 
-        // Create Metal view using full content area (toolbar is above)
-        metalView = MetalView(frame: contentView.bounds)
-        metalView.autoresizingMask = [.width, .height]
+        // Create status bar for tabs
+        statusBar = NSVisualEffectView(frame: .zero)
+        statusBar.translatesAutoresizingMaskIntoConstraints = false
+        statusBar.material = .hudWindow
+        statusBar.blendingMode = .withinWindow
+        statusBar.state = .active
+        contentView.addSubview(statusBar)
+
+        statusLabel = NSTextField(labelWithString: "")
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        statusLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        statusLabel.textColor = NSColor(white: 0.9, alpha: 0.9)
+        statusLabel.lineBreakMode = .byTruncatingTail
+        statusBar.addSubview(statusLabel)
+
+        // Create Metal view below status bar
+        metalView = MetalView(frame: .zero)
+        metalView.translatesAutoresizingMaskIntoConstraints = false
 
         // Add views to content view (Metal view on top of blur)
         contentView.addSubview(metalView)
 
+        NSLayoutConstraint.activate([
+            statusBar.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            statusBar.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            statusBar.topAnchor.constraint(equalTo: contentView.topAnchor),
+            statusBar.heightAnchor.constraint(equalToConstant: statusBarHeight),
+
+            statusLabel.leadingAnchor.constraint(equalTo: statusBar.leadingAnchor, constant: 12),
+            statusLabel.trailingAnchor.constraint(equalTo: statusBar.trailingAnchor, constant: -12),
+            statusLabel.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor),
+
+            metalView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            metalView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            metalView.topAnchor.constraint(equalTo: statusBar.bottomAnchor),
+            metalView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+        ])
+
         // Update URL bar when MetalView navigates
         metalView.onURLChange = { [weak self] url in
             self?.urlBar.stringValue = url
+        }
+
+        metalView.onContentLoaded = { [weak self] url, text in
+            self?.updateActiveTabContent(url: url, text: text)
         }
 
         // Focus URL bar when Tab cycles past last link
@@ -129,6 +182,8 @@ class MainWindow: NSWindow, NSTextFieldDelegate, NSToolbarDelegate {
         ) { [weak self] _ in
             self?.focusURLBarWithAnimation()
         }
+
+        createInitialTab()
     }
 
     private func focusURLBarWithAnimation() {
@@ -197,6 +252,7 @@ class MainWindow: NSWindow, NSTextFieldDelegate, NSToolbarDelegate {
                 url = "https://" + url
             }
             urlBar.stringValue = url
+            updateActiveTabURL(url)
             metalView.loadURL(url)
             makeFirstResponder(metalView)
         }
@@ -227,6 +283,22 @@ class MainWindow: NSWindow, NSTextFieldDelegate, NSToolbarDelegate {
             return
         }
 
+        if event.modifierFlags.contains(.command),
+           let chars = event.charactersIgnoringModifiers?.lowercased() {
+            if chars == "t" {
+                openNewTab()
+                return
+            }
+            if chars == "w" {
+                closeCurrentTab()
+                return
+            }
+            if let num = Int(chars), num >= 1, num <= 9 {
+                switchToTab(index: num - 1)
+                return
+            }
+        }
+
         // Escape focuses MetalView (exit URL bar)
         if event.keyCode == 53 {  // Escape key
             makeFirstResponder(metalView)
@@ -245,6 +317,147 @@ class MainWindow: NSWindow, NSTextFieldDelegate, NSToolbarDelegate {
         // TODO: Notify libvulpes of window close
         // This allows saving state, cleaning up resources, etc.
         super.close()
+    }
+
+    // MARK: - Tabs
+
+    private func createInitialTab() {
+        let home = VulpesConfig.shared.homePage
+        let tab = BrowserTab(
+            id: UUID(),
+            url: home,
+            content: "Loading \(home)...",
+            title: "New Tab",
+            displayTitle: "New Tab",
+            scrollOffset: 0,
+            llmRequestID: nil
+        )
+        tabs = [tab]
+        activeTabIndex = 0
+        updateStatusBar()
+    }
+
+    private func openNewTab() {
+        saveActiveTabSnapshot()
+        let home = VulpesConfig.shared.homePage
+        let newTab = BrowserTab(
+            id: UUID(),
+            url: home,
+            content: "Loading \(home)...",
+            title: "New Tab",
+            displayTitle: "New Tab",
+            scrollOffset: 0,
+            llmRequestID: nil
+        )
+        tabs.append(newTab)
+        activeTabIndex = tabs.count - 1
+        updateStatusBar()
+        urlBar.stringValue = home
+        metalView.loadTabContent(url: home, text: "Loading \(home)...", scrollOffset: 0)
+        metalView.loadURL(home)
+    }
+
+    private func closeCurrentTab() {
+        guard !tabs.isEmpty else { return }
+        tabs.remove(at: activeTabIndex)
+        if tabs.isEmpty {
+            createInitialTab()
+            metalView.loadTabContent(url: tabs[0].url, text: tabs[0].content, scrollOffset: 0)
+            return
+        }
+        activeTabIndex = min(activeTabIndex, tabs.count - 1)
+        switchToTab(index: activeTabIndex)
+    }
+
+    private func switchToTab(index: Int) {
+        guard index >= 0 && index < tabs.count else { return }
+        saveActiveTabSnapshot()
+        activeTabIndex = index
+        let tab = tabs[index]
+        urlBar.stringValue = tab.url
+        metalView.loadTabContent(url: tab.url, text: tab.content, scrollOffset: tab.scrollOffset)
+        updateStatusBar()
+    }
+
+    private func saveActiveTabSnapshot() {
+        guard activeTabIndex >= 0 && activeTabIndex < tabs.count else { return }
+        let snapshot = metalView.snapshotState()
+        tabs[activeTabIndex].url = snapshot.url
+        tabs[activeTabIndex].content = snapshot.text
+        tabs[activeTabIndex].scrollOffset = snapshot.scrollOffset
+    }
+
+    private func updateActiveTabURL(_ url: String) {
+        guard activeTabIndex >= 0 && activeTabIndex < tabs.count else { return }
+        tabs[activeTabIndex].url = url
+        updateStatusBar()
+    }
+
+    private func updateActiveTabContent(url: String, text: String) {
+        guard activeTabIndex >= 0 && activeTabIndex < tabs.count else { return }
+        tabs[activeTabIndex].url = url
+        tabs[activeTabIndex].content = text
+        tabs[activeTabIndex].scrollOffset = 0
+
+        let cleaned = TitleNormalizer.cleanTitle(from: text, url: url)
+        tabs[activeTabIndex].title = cleaned
+        tabs[activeTabIndex].displayTitle = cleaned
+        updateStatusBar()
+        requestLLMTitleIfNeeded(for: tabs[activeTabIndex])
+    }
+
+    private func requestLLMTitleIfNeeded(for tab: BrowserTab) {
+        let config = VulpesConfig.shared
+        guard config.openRouterEnabled, !config.openRouterApiKey.isEmpty else { return }
+        let requestID = UUID()
+        updateTabLLMRequest(id: tab.id, requestID: requestID)
+        OpenRouterClient.generateOneWordTitle(from: tab.title, url: tab.url) { [weak self] result in
+            DispatchQueue.main.async {
+                self?.handleLLMTitleResult(tabID: tab.id, requestID: requestID, result: result)
+            }
+        }
+    }
+
+    private func updateTabLLMRequest(id: UUID, requestID: UUID) {
+        guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
+        tabs[index].llmRequestID = requestID
+    }
+
+    private func handleLLMTitleResult(tabID: UUID, requestID: UUID, result: Result<String, Error>) {
+        guard let index = tabs.firstIndex(where: { $0.id == tabID }) else { return }
+        guard tabs[index].llmRequestID == requestID else { return }
+
+        switch result {
+        case .success(let title):
+            tabs[index].displayTitle = title
+        case .failure:
+            tabs[index].displayTitle = tabs[index].title
+        }
+        updateStatusBar()
+    }
+
+    private func updateStatusBar() {
+        let attributed = NSMutableAttributedString()
+        let inactiveColor = NSColor(white: 0.7, alpha: 0.8)
+        let activeColor = NSColor(white: 1.0, alpha: 0.95)
+        let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+
+        for (index, tab) in tabs.enumerated() {
+            let isActive = index == activeTabIndex
+            let color = isActive ? activeColor : inactiveColor
+            let title = tab.displayTitle.isEmpty ? "New Tab" : tab.displayTitle
+            let text = "[\(index + 1)] \(title)"
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: color,
+            ]
+            attributed.append(NSAttributedString(string: text, attributes: attrs))
+            if index < tabs.count - 1 {
+                attributed.append(NSAttributedString(string: "  ", attributes: attrs))
+            }
+        }
+
+        statusLabel.attributedStringValue = attributed
     }
 
     // MARK: - Future Enhancements

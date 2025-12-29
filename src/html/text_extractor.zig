@@ -30,6 +30,11 @@ const CODE_START: u8 = 0x15; // NAK - Negative Acknowledge
 const CODE_END: u8 = 0x16; // SYN - Synchronous Idle
 const QUOTE_START: u8 = 0x17; // ETB - End of Transmission Block
 const QUOTE_END: u8 = 0x18; // CAN - Cancel
+const H1_START: u8 = 0x19; // EM - End of Medium
+const H2_START: u8 = 0x1A; // SUB - Substitute
+const H3_START: u8 = 0x1B; // ESC - Escape
+const H4_START: u8 = 0x1C; // FS - File Separator
+const HEADING_END: u8 = 0x1D; // GS - Group Separator
 
 /// Tags whose content should be completely skipped
 const skip_tags = [_][]const u8{
@@ -43,26 +48,6 @@ const skip_tags = [_][]const u8{
     "template",
     "svg",
     "math",
-};
-
-/// Tags that should insert a newline
-const block_tags = [_][]const u8{
-    "p",
-    "div",
-    "h1",
-    "h2",
-    "h3",
-    "h4",
-    "h5",
-    "h6",
-    "tr",
-    "section",
-    "article",
-    "header",
-    "footer",
-    "nav",
-    "aside",
-    "main",
 };
 
 /// Extract visible text from HTML content.
@@ -119,6 +104,10 @@ pub fn extractText(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
                     last_was_space = true;
                 }
 
+                if (isHeadingTag(tag_name)) {
+                    try result.append(allocator, HEADING_END);
+                }
+
                 if (std.ascii.eqlIgnoreCase(tag_name, "em") or std.ascii.eqlIgnoreCase(tag_name, "i")) {
                     try result.append(allocator, EMPH_END);
                 }
@@ -162,10 +151,9 @@ pub fn extractText(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
                         current_href = null;
                     }
 
-                    // Check if block tag - add newline
-                    if (isBlockTag(tag_name)) {
-                        const spacing = blockSpacing(tag_name);
-                        try appendNewlines(allocator, &result, spacing);
+                    const spacing_after = blockSpacingAfter(tag_name);
+                    if (spacing_after > 0) {
+                        try appendNewlines(allocator, &result, spacing_after);
                         last_was_space = true;
                     }
                 }
@@ -178,15 +166,19 @@ pub fn extractText(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
                     in_skip_tag = tag_name;
                 }
 
+                const spacing_before = blockSpacingBefore(tag_name);
+                if (spacing_before > 0) {
+                    try appendNewlines(allocator, &result, spacing_before);
+                    last_was_space = true;
+                }
+
                 if (std.ascii.eqlIgnoreCase(tag_name, "pre")) {
                     in_pre = true;
-                    try appendNewlines(allocator, &result, 2);
                     try result.append(allocator, PRE_START);
                     last_was_space = true;
                 }
 
                 if (std.ascii.eqlIgnoreCase(tag_name, "blockquote")) {
-                    try appendNewlines(allocator, &result, 2);
                     try result.append(allocator, QUOTE_START);
                     last_was_space = true;
                 }
@@ -205,7 +197,6 @@ pub fn extractText(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
 
                 if (std.ascii.eqlIgnoreCase(tag_name, "ul") or std.ascii.eqlIgnoreCase(tag_name, "ol")) {
                     if (list_depth < 10) list_depth += 1;
-                    try appendNewlines(allocator, &result, 2);
                     last_was_space = true;
                 }
 
@@ -232,11 +223,9 @@ pub fn extractText(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
                     }
                 }
 
-                // Block tags add newline before
-                if (isBlockTag(tag_name)) {
-                    const spacing = blockSpacing(tag_name);
-                    try appendNewlines(allocator, &result, spacing);
-                    last_was_space = true;
+                if (isHeadingTag(tag_name)) {
+                    const heading_start = headingStartMarker(tag_name) orelse HEADING_END;
+                    try result.append(allocator, heading_start);
                 }
 
                 // Handle self-closing br
@@ -420,36 +409,69 @@ fn isSkipTag(name: []const u8) bool {
     return false;
 }
 
-fn isBlockTag(name: []const u8) bool {
-    for (block_tags) |block| {
-        if (std.ascii.eqlIgnoreCase(name, block)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-fn blockSpacing(name: []const u8) u8 {
-    if (std.ascii.eqlIgnoreCase(name, "p") or
-        std.ascii.eqlIgnoreCase(name, "div") or
-        std.ascii.eqlIgnoreCase(name, "h1") or
+fn isHeadingTag(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "h1") or
         std.ascii.eqlIgnoreCase(name, "h2") or
         std.ascii.eqlIgnoreCase(name, "h3") or
         std.ascii.eqlIgnoreCase(name, "h4") or
         std.ascii.eqlIgnoreCase(name, "h5") or
-        std.ascii.eqlIgnoreCase(name, "h6") or
+        std.ascii.eqlIgnoreCase(name, "h6");
+}
+
+fn headingStartMarker(name: []const u8) ?u8 {
+    if (std.ascii.eqlIgnoreCase(name, "h1")) return H1_START;
+    if (std.ascii.eqlIgnoreCase(name, "h2")) return H2_START;
+    if (std.ascii.eqlIgnoreCase(name, "h3")) return H3_START;
+    if (std.ascii.eqlIgnoreCase(name, "h4")) return H4_START;
+    return H2_START;
+}
+
+fn blockSpacingBefore(name: []const u8) u8 {
+    // HTML Living Standard + CSS UA defaults: block elements have margin-block.
+    // We approximate one line of separation before block elements.
+    if (isHeadingTag(name)) return 1;
+    if (std.ascii.eqlIgnoreCase(name, "p") or
+        std.ascii.eqlIgnoreCase(name, "div") or
         std.ascii.eqlIgnoreCase(name, "section") or
         std.ascii.eqlIgnoreCase(name, "article") or
         std.ascii.eqlIgnoreCase(name, "header") or
         std.ascii.eqlIgnoreCase(name, "footer") or
         std.ascii.eqlIgnoreCase(name, "nav") or
         std.ascii.eqlIgnoreCase(name, "aside") or
-        std.ascii.eqlIgnoreCase(name, "main"))
+        std.ascii.eqlIgnoreCase(name, "main") or
+        std.ascii.eqlIgnoreCase(name, "blockquote") or
+        std.ascii.eqlIgnoreCase(name, "pre") or
+        std.ascii.eqlIgnoreCase(name, "ul") or
+        std.ascii.eqlIgnoreCase(name, "ol") or
+        std.ascii.eqlIgnoreCase(name, "hr"))
+    {
+        return 1;
+    }
+    return 0;
+}
+
+fn blockSpacingAfter(name: []const u8) u8 {
+    // Approximate margin-block-end for block elements as a blank line.
+    if (isHeadingTag(name)) return 2;
+    if (std.ascii.eqlIgnoreCase(name, "p") or
+        std.ascii.eqlIgnoreCase(name, "div") or
+        std.ascii.eqlIgnoreCase(name, "section") or
+        std.ascii.eqlIgnoreCase(name, "article") or
+        std.ascii.eqlIgnoreCase(name, "header") or
+        std.ascii.eqlIgnoreCase(name, "footer") or
+        std.ascii.eqlIgnoreCase(name, "nav") or
+        std.ascii.eqlIgnoreCase(name, "aside") or
+        std.ascii.eqlIgnoreCase(name, "main") or
+        std.ascii.eqlIgnoreCase(name, "blockquote") or
+        std.ascii.eqlIgnoreCase(name, "pre") or
+        std.ascii.eqlIgnoreCase(name, "ul") or
+        std.ascii.eqlIgnoreCase(name, "ol") or
+        std.ascii.eqlIgnoreCase(name, "hr"))
     {
         return 2;
     }
-
-    return 1;
+    if (std.ascii.eqlIgnoreCase(name, "tr")) return 1;
+    return 0;
 }
 
 fn appendNewlines(allocator: std.mem.Allocator, result: *std.ArrayListUnmanaged(u8), count: u8) !void {
@@ -516,7 +538,11 @@ test "basic text extraction" {
     const text = try extractText(std.testing.allocator, html);
     defer std.testing.allocator.free(text);
 
-    try std.testing.expectEqualStrings("Hello World!", text);
+    const expected = &[_]u8{
+        'H', 'e', 'l', 'l', 'o', ' ',
+        STRONG_START, 'W', 'o', 'r', 'l', 'd', STRONG_END, '!',
+    };
+    try std.testing.expectEqualStrings(expected, text);
 }
 
 test "skip script tags" {
@@ -548,7 +574,12 @@ test "block elements add newlines" {
     const text = try extractText(std.testing.allocator, html);
     defer std.testing.allocator.free(text);
 
-    try std.testing.expectEqualStrings("Title\n\nParagraph", text);
+    const expected = &[_]u8{
+        H1_START, 'T', 'i', 't', 'l', 'e', HEADING_END,
+        '\n', '\n',
+        'P', 'a', 'r', 'a', 'g', 'r', 'a', 'p', 'h',
+    };
+    try std.testing.expectEqualStrings(expected, text);
 }
 
 test "extract links with href" {
@@ -618,5 +649,14 @@ test "blockquote markers" {
     defer std.testing.allocator.free(text);
 
     const expected = &[_]u8{ QUOTE_START, 'Q', 'u', 'o', 't', 'e', QUOTE_END };
+    try std.testing.expectEqualStrings(expected, text);
+}
+
+test "heading markers" {
+    const html = "<h2>Title</h2>";
+    const text = try extractText(std.testing.allocator, html);
+    defer std.testing.allocator.free(text);
+
+    const expected = &[_]u8{ H2_START, 'T', 'i', 't', 'l', 'e', HEADING_END };
     try std.testing.expectEqualStrings(expected, text);
 }

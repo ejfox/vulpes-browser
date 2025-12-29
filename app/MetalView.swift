@@ -132,6 +132,7 @@ class MetalView: NSView {
 
     // Callback when URL changes (for updating URL bar)
     var onURLChange: ((String) -> Void)?
+    var onContentLoaded: ((String, String) -> Void)?
 
     // Callback to focus URL bar
     var onRequestURLBarFocus: (() -> Void)?
@@ -148,8 +149,14 @@ class MetalView: NSView {
     // Track if fully initialized
     private var isMetalReady = false
 
+    // MARK: - Error Page Effects
+    private var errorShaderPipeline: MTLRenderPipelineState?
+    private var currentHttpError: Int = 0  // 0 = no error, 404/500/etc = error
+    private var errorShaderStartTime: CFAbsoluteTime = 0
+
     // Simple render timer to ensure the first frame is drawn.
     private var renderTimer: Timer?
+    private var configObserver: NSObjectProtocol?
 
     // MARK: - Layer-Backed View Setup
 
@@ -217,12 +224,29 @@ class MetalView: NSView {
         // Try to load custom GLSL shader if configured
         loadCustomShader()
 
+        configObserver = NotificationCenter.default.addObserver(
+            forName: .vulpesConfigReloaded,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.applyConfig()
+            self?.loadCustomShader()
+            self?.updateTextDisplay()
+            self?.needsDisplay = true
+        }
+
         // Record shader start time for iTime uniform
         shaderStartTime = CFAbsoluteTimeGetCurrent()
 
         isMetalReady = true
         print("MetalView: Metal initialized successfully")
         print("  Device: \(device.name)")
+    }
+
+    deinit {
+        if let observer = configObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
     }
 
     /// Apply settings from VulpesConfig
@@ -284,6 +308,54 @@ class MetalView: NSView {
 
         // Keep rendering during transition
         needsDisplay = true
+    }
+
+    /// Load and apply an error shader for HTTP errors
+    private func setErrorShader(forStatus status: Int) {
+        currentHttpError = status
+        errorShaderStartTime = CFAbsoluteTimeGetCurrent()
+
+        // Pick shader based on error code
+        let shaderName: String
+        switch status {
+        case 404:
+            shaderName = "error-404.glsl"
+        case 500, 502, 503:
+            shaderName = "error-500.glsl"
+        default:
+            // Use 404 shader for other errors
+            shaderName = "error-404.glsl"
+        }
+
+        // Look for shader
+        let projectPath = "/Users/ejfox/code/vulpes-browser/shaders/\(shaderName)"
+        guard FileManager.default.fileExists(atPath: projectPath) else {
+            print("MetalView: Error shader not found: \(shaderName)")
+            return
+        }
+
+        guard let library = device.makeDefaultLibrary(),
+              let vertexFunction = library.makeFunction(name: "vertexShaderFullscreen") else {
+            return
+        }
+
+        if let pipeline = GLSLTranspiler.createPipeline(
+            from: projectPath,
+            device: device,
+            vertexFunction: vertexFunction
+        ) {
+            errorShaderPipeline = pipeline
+            print("MetalView: Error shader loaded for HTTP \(status)")
+        }
+
+        // Keep rendering for continuous animation
+        needsDisplay = true
+    }
+
+    /// Clear error state (called when navigating away)
+    private func clearErrorState() {
+        currentHttpError = 0
+        errorShaderPipeline = nil
     }
 
     private func setupVertexDescriptor() {
@@ -515,9 +587,20 @@ class MetalView: NSView {
     // MARK: - URL Loading
 
     /// Load a URL and display extracted text
-    func loadURL(_ url: String) {
+    /// - Parameters:
+    ///   - url: The URL to load
+    ///   - addToHistory: Whether to add this URL to navigation history (default: true)
+    func loadURL(_ url: String, addToHistory: Bool = true) {
+        // Clear any previous error state
+        clearErrorState()
+
         // Trigger transition effect
         triggerPageTransition()
+
+        // Track in navigation history
+        if addToHistory {
+            NavigationHistory.shared.push(url)
+        }
 
         currentURL = url
         scrollOffset = 0  // Reset scroll position for new page
@@ -544,11 +627,54 @@ class MetalView: NSView {
             print("MetalView: Loaded \(url) in \(Int(elapsed))ms - \(text.count) chars")
 
             DispatchQueue.main.async {
+                // Check if this is an HTTP error response
+                if text.hasPrefix("HTTP ") {
+                    // Parse error code from "HTTP 404" or "HTTP 500"
+                    let parts = text.prefix(10).split(separator: " ")
+                    if parts.count >= 2, let status = Int(parts[1]) {
+                        self?.setErrorShader(forStatus: status)
+                    }
+                }
+
                 self?.displayedText = text
                 self?.parseLinks(from: text)
                 self?.updateTextDisplay()
+                self?.onContentLoaded?(url, text)
             }
         }
+    }
+
+    func snapshotState() -> (url: String, text: String, scrollOffset: Float) {
+        return (currentURL, displayedText, scrollOffset)
+    }
+
+    func loadTabContent(url: String, text: String, scrollOffset: Float) {
+        currentURL = url
+        displayedText = text
+        self.scrollOffset = scrollOffset
+        focusedLinkIndex = -1
+        parseLinks(from: text)
+        updateTextDisplay()
+        onURLChange?(url)
+        needsDisplay = true
+    }
+
+    /// Go back in navigation history
+    func goBack() {
+        guard let url = NavigationHistory.shared.goBack() else {
+            print("MetalView: Can't go back - at start of history")
+            return
+        }
+        loadURL(url, addToHistory: false)
+    }
+
+    /// Go forward in navigation history
+    func goForward() {
+        guard let url = NavigationHistory.shared.goForward() else {
+            print("MetalView: Can't go forward - at end of history")
+            return
+        }
+        loadURL(url, addToHistory: false)
     }
 
     /// Parse links from the "Links:" section of extracted text
@@ -597,36 +723,116 @@ class MetalView: NSView {
         }
 
         let monoFont = CTFontCreateWithName("SF Mono" as CFString, fontSize, nil)
+        let h1Scale: CGFloat = 1.8
+        let h2Scale: CGFloat = 1.5
+        let h3Scale: CGFloat = 1.3
+        let h4Scale: CGFloat = 1.15
+        let h1Font = CTFontCreateWithName("SF Pro Text" as CFString, fontSize * h1Scale, nil)
+        let h2Font = CTFontCreateWithName("SF Pro Text" as CFString, fontSize * h2Scale, nil)
+        let h3Font = CTFontCreateWithName("SF Pro Text" as CFString, fontSize * h3Scale, nil)
+        let h4Font = CTFontCreateWithName("SF Pro Text" as CFString, fontSize * h4Scale, nil)
 
         var glyphsNormal = [CGGlyph](repeating: 0, count: chars.count)
         var glyphsMono = [CGGlyph](repeating: 0, count: chars.count)
+        var glyphsH1 = [CGGlyph](repeating: 0, count: chars.count)
+        var glyphsH2 = [CGGlyph](repeating: 0, count: chars.count)
+        var glyphsH3 = [CGGlyph](repeating: 0, count: chars.count)
+        var glyphsH4 = [CGGlyph](repeating: 0, count: chars.count)
         // Note: mapped may be false if some chars (like control chars) can't be mapped
         // We continue anyway and skip unmappable glyphs
         _ = CTFontGetGlyphsForCharacters(font, chars, &glyphsNormal, chars.count)
         _ = CTFontGetGlyphsForCharacters(monoFont, chars, &glyphsMono, chars.count)
+        _ = CTFontGetGlyphsForCharacters(h1Font, chars, &glyphsH1, chars.count)
+        _ = CTFontGetGlyphsForCharacters(h2Font, chars, &glyphsH2, chars.count)
+        _ = CTFontGetGlyphsForCharacters(h3Font, chars, &glyphsH3, chars.count)
+        _ = CTFontGetGlyphsForCharacters(h4Font, chars, &glyphsH4, chars.count)
 
         let spaceChar: [UniChar] = [0x0020]
         var normalSpaceGlyph: CGGlyph = 0
         var monoSpaceGlyph: CGGlyph = 0
+        var h1SpaceGlyph: CGGlyph = 0
+        var h2SpaceGlyph: CGGlyph = 0
+        var h3SpaceGlyph: CGGlyph = 0
+        var h4SpaceGlyph: CGGlyph = 0
         _ = CTFontGetGlyphsForCharacters(font, spaceChar, &normalSpaceGlyph, 1)
         _ = CTFontGetGlyphsForCharacters(monoFont, spaceChar, &monoSpaceGlyph, 1)
+        _ = CTFontGetGlyphsForCharacters(h1Font, spaceChar, &h1SpaceGlyph, 1)
+        _ = CTFontGetGlyphsForCharacters(h2Font, spaceChar, &h2SpaceGlyph, 1)
+        _ = CTFontGetGlyphsForCharacters(h3Font, spaceChar, &h3SpaceGlyph, 1)
+        _ = CTFontGetGlyphsForCharacters(h4Font, spaceChar, &h4SpaceGlyph, 1)
 
         var vertices: [Vertex] = []
         vertices.reserveCapacity(chars.count * 6)
 
         let margin: Float = Float(20.0 * scale)
         let quoteIndent: Float = Float(24.0 * scale)
-        let maxWidth: Float = Float(bounds.width * scale) - margin * 2
+        let viewportWidth: Float = Float(bounds.width * scale) - margin * 2
+        let targetLineWidth = VulpesConfig.shared.readableLineWidth
+        let contentWidth: Float
+        if targetLineWidth <= 0 {
+            contentWidth = viewportWidth
+        } else if let spaceEntry = atlas.entry(for: normalSpaceGlyph, font: font) {
+            let readableWidth = Float(spaceEntry.advance) * max(20.0, targetLineWidth)
+            contentWidth = min(viewportWidth, readableWidth)
+        } else {
+            contentWidth = viewportWidth
+        }
         var quoteDepth: Int = 0
         func lineStartX() -> Float {
             margin + quoteIndent * Float(quoteDepth)
         }
         func lineMaxX() -> Float {
-            let maxX = maxWidth - quoteIndent * Float(quoteDepth)
+            let maxX = margin + contentWidth
             return max(maxX, lineStartX() + 1.0)
+        }
+
+        func headingFont(for level: Int, h1: CTFont, h2: CTFont, h3: CTFont, h4: CTFont) -> CTFont {
+            switch level {
+            case 1:
+                return h1
+            case 2:
+                return h2
+            case 3:
+                return h3
+            default:
+                return h4
+            }
+        }
+
+        func headingGlyph(for level: Int, h1: [CGGlyph], h2: [CGGlyph], h3: [CGGlyph], h4: [CGGlyph], index: Int) -> CGGlyph {
+            switch level {
+            case 1:
+                return h1[index]
+            case 2:
+                return h2[index]
+            case 3:
+                return h3[index]
+            default:
+                return h4[index]
+            }
+        }
+
+        func headingSpaceGlyph(for level: Int, h1: CGGlyph, h2: CGGlyph, h3: CGGlyph, h4: CGGlyph) -> CGGlyph {
+            switch level {
+            case 1:
+                return h1
+            case 2:
+                return h2
+            case 3:
+                return h3
+            default:
+                return h4
+            }
         }
         var penX: Float = lineStartX()
         var penY: Float = margin + Float(fontSize)
+        let baseLineHeight: Float = lineHeight
+        let h1LineHeight: Float = lineHeight * Float(h1Scale)
+        let h2LineHeight: Float = lineHeight * Float(h2Scale)
+        let h3LineHeight: Float = lineHeight * Float(h3Scale)
+        let h4LineHeight: Float = lineHeight * Float(h4Scale)
+        var currentLineHeight: Float = baseLineHeight
+        var extraSpacingAfterHeading: Float = 0
 
         // Apply scroll offset (negative = content moves up)
         let scrollAdjust = -scrollOffset * Float(scale)
@@ -654,12 +860,18 @@ class MetalView: NSView {
         let codeEnd: UInt16 = 0x0016
         let quoteStart: UInt16 = 0x0017
         let quoteEnd: UInt16 = 0x0018
+        let h1Start: UInt16 = 0x0019
+        let h2Start: UInt16 = 0x001A
+        let h3Start: UInt16 = 0x001B
+        let h4Start: UInt16 = 0x001C
+        let headingEnd: UInt16 = 0x001D
 
         var inPre = false
         var inLink = false
         var inEmphasis = false
         var inStrong = false
         var inCode = false
+        var headingLevel: Int = 0
         var pendingEntries: [GlyphAtlas.GlyphEntry] = []
         pendingEntries.reserveCapacity(32)
         var pendingWidth: Float = 0
@@ -668,6 +880,9 @@ class MetalView: NSView {
             var base = inLink ? linkColor : normalColor
             if inLink && currentLinkIndex == focusedLinkIndex {
                 base = focusedLinkColor
+            }
+            if headingLevel > 0 && !inLink {
+                base = SIMD4<Float>(1.0, 1.0, 1.0, base.w)
             }
 
             if inStrong {
@@ -731,7 +946,7 @@ class MetalView: NSView {
 
             if penX + pendingWidth > lineMaxX() && penX > lineStartX() {
                 penX = lineStartX()
-                penY += lineHeight
+                penY += currentLineHeight
             }
 
             for entry in pendingEntries {
@@ -788,6 +1003,42 @@ class MetalView: NSView {
                 inPre = false
                 continue
             }
+            if char == h1Start {
+                flushPendingWord()
+                headingLevel = 1
+                currentLineHeight = h1LineHeight
+                updateCurrentColor()
+                continue
+            }
+            if char == h2Start {
+                flushPendingWord()
+                headingLevel = 2
+                currentLineHeight = h2LineHeight
+                updateCurrentColor()
+                continue
+            }
+            if char == h3Start {
+                flushPendingWord()
+                headingLevel = 3
+                currentLineHeight = h3LineHeight
+                updateCurrentColor()
+                continue
+            }
+            if char == h4Start {
+                flushPendingWord()
+                headingLevel = 4
+                currentLineHeight = h4LineHeight
+                updateCurrentColor()
+                continue
+            }
+            if char == headingEnd {
+                flushPendingWord()
+                headingLevel = 0
+                currentLineHeight = baseLineHeight
+                extraSpacingAfterHeading = baseLineHeight * 0.25
+                updateCurrentColor()
+                continue
+            }
             if char == emphStart {
                 flushPendingWord()
                 inEmphasis = true
@@ -828,7 +1079,7 @@ class MetalView: NSView {
                 flushPendingWord()
                 if penX != lineStartX() {
                     penX = lineStartX()
-                    penY += lineHeight
+                    penY += currentLineHeight
                 }
                 quoteDepth += 1
                 penX = lineStartX()
@@ -845,13 +1096,15 @@ class MetalView: NSView {
             if char == 0x000A { // newline
                 flushPendingWord()
                 penX = lineStartX()
-                penY += lineHeight
+                penY += currentLineHeight + extraSpacingAfterHeading
+                extraSpacingAfterHeading = 0
                 continue
             }
 
             let useMono = inPre || inCode
-            let glyph = useMono ? glyphsMono[i] : glyphsNormal[i]
-            let activeFont = useMono ? monoFont : font
+            let isHeading = headingLevel > 0 && !useMono
+            let glyph = useMono ? glyphsMono[i] : (isHeading ? headingGlyph(for: headingLevel, h1: glyphsH1, h2: glyphsH2, h3: glyphsH3, h4: glyphsH4, index: i) : glyphsNormal[i])
+            let activeFont = useMono ? monoFont : (isHeading ? headingFont(for: headingLevel, h1: h1Font, h2: h2Font, h3: h3Font, h4: h4Font) : font)
 
             if inPre {
                 if char == 0x0009 { // tab
@@ -874,7 +1127,7 @@ class MetalView: NSView {
             if char == 0x0020 || char == 0x0009 {
                 flushPendingWord()
                 if penX > lineStartX() {
-                    let spaceGlyph = useMono ? monoSpaceGlyph : normalSpaceGlyph
+                    let spaceGlyph = useMono ? monoSpaceGlyph : (isHeading ? headingSpaceGlyph(for: headingLevel, h1: h1SpaceGlyph, h2: h2SpaceGlyph, h3: h3SpaceGlyph, h4: h4SpaceGlyph) : normalSpaceGlyph)
                     if let spaceEntry = atlas.entry(for: spaceGlyph, font: activeFont) {
                         penX += Float(spaceEntry.advance)
                     }
@@ -1181,9 +1434,21 @@ class MetalView: NSView {
                 bloomEncoder.setFragmentBuffer(uniformBuffer, offset: 0, index: 0)
             }
 
-            // Select shader pipeline: transition > custom > bloom
+            // Select shader pipeline: transition > error > custom > bloom
             if isTransitioning, let transitionPipeline = transitionManager.shaderPipeline {
                 bloomEncoder.setRenderPipelineState(transitionPipeline)
+            } else if currentHttpError != 0, let errorPipeline = errorShaderPipeline {
+                // Error shader - use error-specific time for continuous animation
+                var errorUniforms = PostProcessUniforms(
+                    iResolution: SIMD2<Float>(Float(drawableSize.width), Float(drawableSize.height)),
+                    iTime: Float(now - errorShaderStartTime)
+                )
+                memcpy(uniformBuffer.contents(), &errorUniforms, MemoryLayout<PostProcessUniforms>.stride)
+                bloomEncoder.setRenderPipelineState(errorPipeline)
+                // Keep rendering for continuous animation
+                DispatchQueue.main.async { [weak self] in
+                    self?.needsDisplay = true
+                }
             } else if let customPipeline = customShaderPipeline {
                 bloomEncoder.setRenderPipelineState(customPipeline)
             } else {
@@ -1221,6 +1486,10 @@ class MetalView: NSView {
     override func keyDown(with event: NSEvent) {
         // Don't call super - we handle all keys ourselves
         // This prevents the system beep
+
+        if event.modifierFlags.contains(.command) {
+            return
+        }
 
         guard let chars = event.charactersIgnoringModifiers else { return }
 
@@ -1268,6 +1537,14 @@ class MetalView: NSView {
         case "/":
             // Focus URL bar (vim-style)
             NotificationCenter.default.post(name: .focusURLBar, object: nil)
+            lastKeyChar = ""
+        case "b":
+            // Go back in history
+            goBack()
+            lastKeyChar = ""
+        case "f":
+            // Go forward in history
+            goForward()
             lastKeyChar = ""
         default:
             // Check for number keys 1-9 for link navigation

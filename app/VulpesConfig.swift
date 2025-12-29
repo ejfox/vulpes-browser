@@ -11,6 +11,7 @@
 //   shader = /absolute/path/to/shader.glsl
 
 import Foundation
+import Darwin
 
 class VulpesConfig {
     static let shared = VulpesConfig()
@@ -22,6 +23,7 @@ class VulpesConfig {
     var textColor: (r: Float, g: Float, b: Float) = (0.9, 0.9, 0.9)
     var linkColor: (r: Float, g: Float, b: Float) = (0.4, 0.6, 1.0)
     var fontSize: Float = 16.0
+    var readableLineWidth: Float = 82.0
 
     // Shader settings
     var shaderPath: String? = nil  // Path to custom GLSL post-process shader
@@ -40,11 +42,24 @@ class VulpesConfig {
     // Home page
     var homePage: String = "https://ejfox.com"
 
+    // OpenRouter (LLM title cleanup)
+    var openRouterEnabled: Bool = false
+    var openRouterApiKey: String = ""
+    var openRouterModel: String = "meta-llama/llama-3.2-3b-instruct"
+    var openRouterModels: [String] = [
+        "meta-llama/llama-3.2-3b-instruct",
+        "meta-llama/llama-3.1-8b-instruct",
+        "mistralai/mistral-nemo",
+    ]
+    var openRouterMinIntervalMs: Int = 2000
+
     // MARK: - Paths
 
     private let configDir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".config/vulpes")
     private let configFile: URL
+    private var configWatchSource: DispatchSourceFileSystemObject?
+    private var configWatchFD: Int32 = -1
 
     // Ghostty shader directory (for shader = name shorthand)
     private let ghosttyShaderDir = FileManager.default.homeDirectoryForCurrentUser
@@ -56,6 +71,7 @@ class VulpesConfig {
         configFile = configDir.appendingPathComponent("config")
         ensureConfigDir()
         loadConfig()
+        startConfigWatch()
     }
 
     private func ensureConfigDir() {
@@ -76,6 +92,16 @@ class VulpesConfig {
 
         # Font size (points)
         font_size = 16
+        # Target readable line width (approx characters)
+        # Set to 0 to disable and use full window width
+        readable_line_width = 82
+
+        # OpenRouter (one-word tab titles)
+        # openrouter_enabled = false
+        # openrouter_api_key = sk-or-...
+        # openrouter_model = meta-llama/llama-3.2-3b-instruct
+        # openrouter_models = meta-llama/llama-3.2-3b-instruct, meta-llama/llama-3.1-8b-instruct, mistralai/mistral-nemo
+        # openrouter_min_interval_ms = 2000
 
         # Colors (RGB 0-1)
         # text_color = 0.9 0.9 0.9
@@ -143,6 +169,9 @@ class VulpesConfig {
         case "font_size":
             fontSize = Float(value) ?? fontSize
 
+        case "readable_line_width":
+            readableLineWidth = Float(value) ?? readableLineWidth
+
         case "text_color":
             if let color = parseColor(value) {
                 textColor = color
@@ -181,6 +210,27 @@ class VulpesConfig {
 
         case "particle_count":
             particleCount = Int(value) ?? particleCount
+
+        case "openrouter_enabled":
+            openRouterEnabled = parseBool(value)
+
+        case "openrouter_api_key":
+            openRouterApiKey = value
+
+        case "openrouter_model":
+            openRouterModel = value
+
+        case "openrouter_models":
+            let models = value
+                .split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            if !models.isEmpty {
+                openRouterModels = models
+            }
+
+        case "openrouter_min_interval_ms":
+            openRouterMinIntervalMs = Int(value) ?? openRouterMinIntervalMs
 
         default:
             print("VulpesConfig: Unknown key '\(key)'")
@@ -238,6 +288,45 @@ class VulpesConfig {
     func reload() {
         loadConfig()
         NotificationCenter.default.post(name: .vulpesConfigReloaded, object: nil)
+    }
+
+    private func startConfigWatch() {
+        guard configWatchSource == nil else { return }
+
+        configWatchFD = open(configFile.path, O_EVTONLY)
+        guard configWatchFD >= 0 else {
+            print("VulpesConfig: Failed to watch config file")
+            return
+        }
+
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: configWatchFD,
+            eventMask: [.write, .rename, .delete],
+            queue: DispatchQueue.main
+        )
+
+        source.setEventHandler { [weak self] in
+            guard let self else { return }
+            let flags = source.data
+            self.reload()
+
+            if flags.contains(.delete) || flags.contains(.rename) {
+                source.cancel()
+                self.configWatchSource = nil
+                self.startConfigWatch()
+            }
+        }
+
+        source.setCancelHandler { [weak self] in
+            guard let self else { return }
+            if self.configWatchFD >= 0 {
+                close(self.configWatchFD)
+                self.configWatchFD = -1
+            }
+        }
+
+        source.resume()
+        configWatchSource = source
     }
 }
 

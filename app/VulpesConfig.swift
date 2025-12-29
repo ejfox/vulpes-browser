@@ -244,4 +244,5 @@ class VulpesConfig {
 // Notification for config reload
 extension Notification.Name {
     static let vulpesConfigReloaded = Notification.Name("vulpesConfigReloaded")
+    static let focusURLBar = Notification.Name("focusURLBar")
 }

@@ -120,6 +120,34 @@ class MainWindow: NSWindow, NSTextFieldDelegate, NSToolbarDelegate {
         metalView.onRequestURLBarFocus = { [weak self] in
             self?.makeFirstResponder(self?.urlBar)
         }
+
+        // Listen for / key to focus URL bar (vim-style)
+        NotificationCenter.default.addObserver(
+            forName: .focusURLBar,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.focusURLBarWithAnimation()
+        }
+    }
+
+    private func focusURLBarWithAnimation() {
+        // Focus and select all text
+        makeFirstResponder(urlBar)
+        urlBar.selectText(nil)
+
+        // Subtle pulse animation on the URL bar
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.15
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            urlBar.animator().alphaValue = 0.7
+        } completionHandler: { [weak self] in
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.15
+                context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+                self?.urlBar.animator().alphaValue = 1.0
+            }
+        }
     }
 
     // MARK: - NSToolbarDelegate

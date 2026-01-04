@@ -77,6 +77,10 @@ class MetalView: NSView {
 
     // MARK: - Glyph Atlas
     private var glyphAtlas: GlyphAtlas?
+    
+    // MARK: - Image Atlas
+    private var imageAtlas: ImageAtlas?
+    private var imagePipelineState: MTLRenderPipelineState!
 
     // MARK: - Content Display
     private var testVertexBuffer: MTLBuffer?
@@ -89,6 +93,19 @@ class MetalView: NSView {
 
     // Extracted links for navigation
     private var extractedLinks: [String] = []
+    
+    // Extracted images for rendering
+    private var extractedImages: [String] = []
+    
+    // Image placement data (position and size for each image)
+    private struct ImagePlacement {
+        let imageIndex: Int
+        let x: Float
+        let y: Float
+        let width: Float
+        let height: Float
+    }
+    private var imagePlacements: [ImagePlacement] = []
 
     // Focused link for Tab navigation (-1 = no focus, 0+ = link index)
     private var focusedLinkIndex: Int = -1
@@ -217,12 +234,24 @@ class MetalView: NSView {
 
         // Create glyph atlas for text rendering
         glyphAtlas = GlyphAtlas(device: device)
+        
+        // Create image atlas for image rendering
+        imageAtlas = ImageAtlas(device: device)
 
         // Apply config settings
         applyConfig()
 
         // Try to load custom GLSL shader if configured
         loadCustomShader()
+        
+        // Listen for image load notifications to trigger redraw
+        NotificationCenter.default.addObserver(
+            forName: .imageLoaded,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.needsDisplay = true
+        }
 
         configObserver = NotificationCenter.default.addObserver(
             forName: .vulpesConfigReloaded,
@@ -526,6 +555,33 @@ class MetalView: NSView {
             fatalError("MetalView: Failed to create bloom pipeline state: \(error)")
         }
 
+        // Create image pipeline (for rendering images from atlas)
+        guard let fragmentImage = library.makeFunction(name: "fragmentShaderImage") else {
+            fatalError("MetalView: Failed to load fragmentShaderImage function")
+        }
+
+        let imageDescriptor = MTLRenderPipelineDescriptor()
+        imageDescriptor.label = "Image Pipeline"
+        imageDescriptor.vertexFunction = vertexFunction
+        imageDescriptor.fragmentFunction = fragmentImage
+        imageDescriptor.vertexDescriptor = vertexDescriptor
+        imageDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+
+        // Alpha blending for images
+        imageDescriptor.colorAttachments[0].isBlendingEnabled = true
+        imageDescriptor.colorAttachments[0].rgbBlendOperation = .add
+        imageDescriptor.colorAttachments[0].alphaBlendOperation = .add
+        imageDescriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        imageDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+        imageDescriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        imageDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+
+        do {
+            imagePipelineState = try device.makeRenderPipelineState(descriptor: imageDescriptor)
+        } catch {
+            fatalError("MetalView: Failed to create image pipeline state: \(error)")
+        }
+
         print("MetalView: Render pipelines created")
     }
 
@@ -677,33 +733,76 @@ class MetalView: NSView {
         loadURL(url, addToHistory: false)
     }
 
-    /// Parse links from the "Links:" section of extracted text
+    /// Parse links and images from the extracted text sections
     private func parseLinks(from text: String) {
         extractedLinks = []
+        extractedImages = []
 
         // Find the Links: section
-        guard let linksRange = text.range(of: "---\nLinks:\n") else {
-            return
-        }
+        if let linksRange = text.range(of: "---\nLinks:\n") {
+            let afterLinks = text[linksRange.upperBound...]
+            
+            // Find where Images section starts (or end of string)
+            let linksEnd: String.Index
+            if let imagesRange = afterLinks.range(of: "---\nImages:\n") {
+                linksEnd = imagesRange.lowerBound
+            } else {
+                linksEnd = afterLinks.endIndex
+            }
+            
+            let linksSection = String(afterLinks[..<linksEnd])
 
-        let linksSection = String(text[linksRange.upperBound...])
+            // Parse each line like "[1] https://..."
+            for line in linksSection.components(separatedBy: "\n") {
+                // Skip empty lines and section markers
+                guard !line.isEmpty, !line.hasPrefix("---") else { continue }
 
-        // Parse each line like "[1] https://..."
-        for line in linksSection.components(separatedBy: "\n") {
-            // Skip empty lines
-            guard !line.isEmpty else { continue }
-
-            // Extract URL after "] "
-            if let bracketEnd = line.firstIndex(of: "]"),
-               let spaceAfter = line.index(bracketEnd, offsetBy: 1, limitedBy: line.endIndex),
-               line[spaceAfter] == " " {
-                let urlStart = line.index(after: spaceAfter)
-                let url = String(line[urlStart...])
-                extractedLinks.append(url)
+                // Extract URL after "] "
+                if let bracketEnd = line.firstIndex(of: "]"),
+                   let spaceAfter = line.index(bracketEnd, offsetBy: 1, limitedBy: line.endIndex),
+                   line[spaceAfter] == " " {
+                    let urlStart = line.index(after: spaceAfter)
+                    let url = String(line[urlStart...])
+                    extractedLinks.append(url)
+                }
             }
         }
 
-        print("MetalView: Parsed \(extractedLinks.count) links")
+        // Find the Images: section
+        if let imagesRange = text.range(of: "---\nImages:\n") {
+            let imagesSection = String(text[imagesRange.upperBound...])
+
+            // Parse each line like "[1] https://..."
+            for line in imagesSection.components(separatedBy: "\n") {
+                // Skip empty lines
+                guard !line.isEmpty else { continue }
+
+                // Extract URL after "] "
+                if let bracketEnd = line.firstIndex(of: "]"),
+                   let spaceAfter = line.index(bracketEnd, offsetBy: 1, limitedBy: line.endIndex),
+                   line[spaceAfter] == " " {
+                    let urlStart = line.index(after: spaceAfter)
+                    var imageURL = String(line[urlStart...])
+                    
+                    // Resolve relative URLs
+                    if imageURL.hasPrefix("/") {
+                        if let currentURLObj = URL(string: currentURL),
+                           let baseURL = URL(string: "/", relativeTo: currentURLObj) {
+                            imageURL = baseURL.absoluteString.dropLast() + imageURL
+                        }
+                    }
+                    
+                    extractedImages.append(imageURL)
+                    
+                    // Pre-fetch image into atlas
+                    if let atlas = imageAtlas {
+                        _ = atlas.entry(for: imageURL)
+                    }
+                }
+            }
+        }
+
+        print("MetalView: Parsed \(extractedLinks.count) links, \(extractedImages.count) images")
     }
 
     /// Update the text vertex buffer with current displayedText
@@ -865,6 +964,7 @@ class MetalView: NSView {
         let h3Start: UInt16 = 0x001B
         let h4Start: UInt16 = 0x001C
         let headingEnd: UInt16 = 0x001D
+        let imageMarker: UInt16 = 0x001E  // Image placeholder marker
 
         var inPre = false
         var inLink = false
@@ -875,6 +975,11 @@ class MetalView: NSView {
         var pendingEntries: [GlyphAtlas.GlyphEntry] = []
         pendingEntries.reserveCapacity(32)
         var pendingWidth: Float = 0
+        
+        // Track images for placement
+        imagePlacements = []
+        var inImageMarker = false
+        var imageNumberBuffer: [UniChar] = []
 
         func updateCurrentColor() {
             var base = inLink ? linkColor : normalColor
@@ -1001,6 +1106,53 @@ class MetalView: NSView {
             if char == preEnd {
                 flushPendingWord()
                 inPre = false
+                continue
+            }
+            if char == imageMarker {
+                // Toggle image marker state
+                if !inImageMarker {
+                    // Start of image marker - begin collecting number
+                    flushPendingWord()
+                    inImageMarker = true
+                    imageNumberBuffer = []
+                } else {
+                    // End of image marker - parse number and create placement
+                    inImageMarker = false
+                    if let numStr = String(utf16CodeUnits: imageNumberBuffer, count: imageNumberBuffer.count) as String?,
+                       let imageNum = Int(numStr), imageNum > 0, imageNum <= extractedImages.count {
+                        let imageIndex = imageNum - 1
+                        
+                        // Calculate image size (scale to fit line width)
+                        let maxImageWidth = lineMaxX() - lineStartX()
+                        let desiredWidth: Float = min(400.0 * Float(scale), maxImageWidth)
+                        
+                        // Move to new line for image
+                        if penX != lineStartX() {
+                            penX = lineStartX()
+                            penY += currentLineHeight
+                        }
+                        
+                        // Create image placement (height will be calculated from aspect ratio when rendering)
+                        let placement = ImagePlacement(
+                            imageIndex: imageIndex,
+                            x: penX / Float(scale),
+                            y: penY / Float(scale),
+                            width: desiredWidth / Float(scale),
+                            height: desiredWidth / Float(scale) * 0.75  // Default 4:3 aspect ratio, will be corrected on render
+                        )
+                        imagePlacements.append(placement)
+                        
+                        // Advance pen past image
+                        penY += desiredWidth * 0.75  // Reserve space for image
+                        penY += currentLineHeight * 0.5  // Add spacing after image
+                        penX = lineStartX()
+                    }
+                }
+                continue
+            }
+            // If we're collecting image number, add to buffer
+            if inImageMarker {
+                imageNumberBuffer.append(char)
                 continue
             }
             if char == h1Start {
@@ -1375,6 +1527,52 @@ class MetalView: NSView {
             sceneEncoder.setVertexBuffer(uniformBuffer, offset: 0, index: 1)
             sceneEncoder.setFragmentTexture(atlas.texture, index: 0)
             sceneEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: textVertexCount)
+        }
+
+        // Draw images from image atlas
+        if let imageAtlas = imageAtlas, !imagePlacements.isEmpty {
+            sceneEncoder.setRenderPipelineState(imagePipelineState)
+            sceneEncoder.setVertexBuffer(uniformBuffer, offset: 0, index: 1)
+            
+            for placement in imagePlacements {
+                // Check if image is loaded
+                guard placement.imageIndex < extractedImages.count else { continue }
+                let imageURL = extractedImages[placement.imageIndex]
+                guard let entry = imageAtlas.entry(for: imageURL) else { continue }
+                
+                // Use atlas texture or individual texture
+                let texture = entry.texture ?? imageAtlas.getAtlasTexture()
+                guard let texture = texture else { continue }
+                
+                // Calculate actual image size preserving aspect ratio
+                let aspectRatio = entry.size.width / entry.size.height
+                let width = placement.width * Float(metalLayer.contentsScale)
+                let height = width / Float(aspectRatio)
+                
+                // Build vertices for image quad
+                let x = placement.x * Float(metalLayer.contentsScale)
+                let y = (placement.y - scrollOffset) * Float(metalLayer.contentsScale)
+                
+                let vertices: [Vertex] = [
+                    Vertex(position: SIMD2<Float>(x, y), texCoord: SIMD2<Float>(Float(entry.uvRect.minX), Float(entry.uvRect.maxY)), color: SIMD4<Float>(1, 1, 1, 1)),
+                    Vertex(position: SIMD2<Float>(x + width, y), texCoord: SIMD2<Float>(Float(entry.uvRect.maxX), Float(entry.uvRect.maxY)), color: SIMD4<Float>(1, 1, 1, 1)),
+                    Vertex(position: SIMD2<Float>(x, y + height), texCoord: SIMD2<Float>(Float(entry.uvRect.minX), Float(entry.uvRect.minY)), color: SIMD4<Float>(1, 1, 1, 1)),
+                    Vertex(position: SIMD2<Float>(x + width, y), texCoord: SIMD2<Float>(Float(entry.uvRect.maxX), Float(entry.uvRect.maxY)), color: SIMD4<Float>(1, 1, 1, 1)),
+                    Vertex(position: SIMD2<Float>(x + width, y + height), texCoord: SIMD2<Float>(Float(entry.uvRect.maxX), Float(entry.uvRect.minY)), color: SIMD4<Float>(1, 1, 1, 1)),
+                    Vertex(position: SIMD2<Float>(x, y + height), texCoord: SIMD2<Float>(Float(entry.uvRect.minX), Float(entry.uvRect.minY)), color: SIMD4<Float>(1, 1, 1, 1)),
+                ]
+                
+                // Create vertex buffer for this image
+                guard let imageBuffer = device.makeBuffer(
+                    bytes: vertices,
+                    length: MemoryLayout<Vertex>.stride * vertices.count,
+                    options: .storageModeShared
+                ) else { continue }
+                
+                sceneEncoder.setVertexBuffer(imageBuffer, offset: 0, index: 0)
+                sceneEncoder.setFragmentTexture(texture, index: 0)
+                sceneEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+            }
         }
 
         // Draw particles ON TOP of text (additive blending for glow)

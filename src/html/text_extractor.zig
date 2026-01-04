@@ -15,6 +15,8 @@ const std = @import("std");
 
 /// Maximum number of links to track
 const MAX_LINKS = 99;
+/// Maximum number of images to track
+const MAX_IMAGES = 50;
 
 /// Control characters for marking link text
 /// These are parsed by Swift to apply blue color
@@ -35,6 +37,7 @@ const H2_START: u8 = 0x1A; // SUB - Substitute
 const H3_START: u8 = 0x1B; // ESC - Escape
 const H4_START: u8 = 0x1C; // FS - File Separator
 const HEADING_END: u8 = 0x1D; // GS - Group Separator
+const IMAGE_MARKER: u8 = 0x1E; // RS - Record Separator (marks image placeholder)
 
 /// Tags whose content should be completely skipped
 const skip_tags = [_][]const u8{
@@ -53,6 +56,7 @@ const skip_tags = [_][]const u8{
 /// Extract visible text from HTML content.
 /// Caller owns returned slice and must free with same allocator.
 /// Links are extracted and appended at the end as numbered references.
+/// Images are marked with IMAGE_MARKER control character and listed separately.
 pub fn extractText(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
     var result: std.ArrayListUnmanaged(u8) = .empty;
     errdefer result.deinit(allocator);
@@ -60,6 +64,10 @@ pub fn extractText(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
     // Track extracted links
     var links: [MAX_LINKS][]const u8 = undefined;
     var link_count: usize = 0;
+
+    // Track extracted images
+    var images: [MAX_IMAGES][]const u8 = undefined;
+    var image_count: usize = 0;
 
     // Track current link state
     var in_link: bool = false;
@@ -223,6 +231,24 @@ pub fn extractText(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
                     }
                 }
 
+                // Handle <img> tags - extract src and insert image marker
+                if (std.ascii.eqlIgnoreCase(tag_name, "img")) {
+                    if (const img_src = extractImgSrc(html[i..tag_end + 1])) {
+                        if (image_count < MAX_IMAGES) {
+                            images[image_count] = img_src;
+                            // Insert image placeholder with number
+                            try result.append(allocator, IMAGE_MARKER);
+                            var num_buf: [3]u8 = undefined;
+                            const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{image_count + 1}) catch "?";
+                            try result.appendSlice(allocator, num_str);
+                            try result.append(allocator, IMAGE_MARKER);
+                            image_count += 1;
+                            try result.append(allocator, ' ');
+                            last_was_space = true;
+                        }
+                    }
+                }
+
                 if (isHeadingTag(tag_name)) {
                     const heading_start = headingStartMarker(tag_name) orelse HEADING_END;
                     try result.append(allocator, heading_start);
@@ -336,6 +362,20 @@ pub fn extractText(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
         }
     }
 
+    // Append images section if we found any
+    if (image_count > 0) {
+        try result.appendSlice(allocator, "\n---\nImages:\n");
+        for (images[0..image_count], 1..) |src, num| {
+            try result.append(allocator, '[');
+            var num_buf: [3]u8 = undefined;
+            const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{num}) catch "?";
+            try result.appendSlice(allocator, num_str);
+            try result.appendSlice(allocator, "] ");
+            try result.appendSlice(allocator, src);
+            try result.append(allocator, '\n');
+        }
+    }
+
     return result.toOwnedSlice(allocator);
 }
 
@@ -364,6 +404,53 @@ fn extractHref(tag: []const u8) ?[]const u8 {
             tag[i + 4] == '=')
         {
             i += 5;
+
+            // Skip whitespace
+            while (i < tag.len and (tag[i] == ' ' or tag[i] == '\t')) {
+                i += 1;
+            }
+
+            if (i >= tag.len) return null;
+
+            // Check for quote
+            const quote = tag[i];
+            if (quote == '"' or quote == '\'') {
+                i += 1;
+                const start = i;
+                while (i < tag.len and tag[i] != quote) {
+                    i += 1;
+                }
+                if (i > start) {
+                    return tag[start..i];
+                }
+            } else {
+                // Unquoted value - ends at space or >
+                const start = i;
+                while (i < tag.len and tag[i] != ' ' and tag[i] != '>' and tag[i] != '\t') {
+                    i += 1;
+                }
+                if (i > start) {
+                    return tag[start..i];
+                }
+            }
+            return null;
+        }
+        i += 1;
+    }
+    return null;
+}
+
+/// Extract src attribute value from an <img> tag
+fn extractImgSrc(tag: []const u8) ?[]const u8 {
+    // Look for src= (case insensitive)
+    var i: usize = 0;
+    while (i + 4 < tag.len) {
+        if ((tag[i] == 's' or tag[i] == 'S') and
+            (tag[i + 1] == 'r' or tag[i + 1] == 'R') and
+            (tag[i + 2] == 'c' or tag[i + 2] == 'C') and
+            tag[i + 3] == '=')
+        {
+            i += 4;
 
             // Skip whitespace
             while (i < tag.len and (tag[i] == ' ' or tag[i] == '\t')) {

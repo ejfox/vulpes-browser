@@ -289,3 +289,72 @@ fragment float4 fragmentShaderPassthrough(
 // - Requires knowing the background color (compositing challenge)
 //
 // For Phase 1, grayscale antialiasing is sufficient.
+
+// MARK: - Image Rendering
+
+// Image fragment shader - renders images from atlas with optional effects
+// Used for: inline images, background images
+fragment float4 fragmentShaderImage(
+    VertexOut in [[stage_in]],
+    texture2d<float> imageAtlas [[texture(0)]]
+) {
+    constexpr sampler imageSampler(
+        mag_filter::linear,    // Smooth scaling
+        min_filter::linear,
+        address::clamp_to_edge
+    );
+    
+    // Sample the image atlas
+    float4 color = imageAtlas.sample(imageSampler, in.texCoord);
+    
+    // Apply vertex alpha for fade effects
+    color.a *= in.color.a;
+    
+    // Optionally tint based on vertex color (useful for hover effects)
+    // Preserve original color but allow alpha and brightness modulation
+    color.rgb *= in.color.rgb;
+    
+    return color;
+}
+
+// Image fragment shader with grayscale effect (shader-based filter)
+fragment float4 fragmentShaderImageGrayscale(
+    VertexOut in [[stage_in]],
+    texture2d<float> imageAtlas [[texture(0)]]
+) {
+    constexpr sampler imageSampler(
+        mag_filter::linear,
+        min_filter::linear,
+        address::clamp_to_edge
+    );
+    
+    float4 color = imageAtlas.sample(imageSampler, in.texCoord);
+    
+    // Convert to grayscale using luminance
+    float gray = dot(color.rgb, float3(0.299, 0.587, 0.114));
+    
+    return float4(gray, gray, gray, color.a * in.color.a);
+}
+
+// Image fragment shader with sepia tone effect
+fragment float4 fragmentShaderImageSepia(
+    VertexOut in [[stage_in]],
+    texture2d<float> imageAtlas [[texture(0)]]
+) {
+    constexpr sampler imageSampler(
+        mag_filter::linear,
+        min_filter::linear,
+        address::clamp_to_edge
+    );
+    
+    float4 color = imageAtlas.sample(imageSampler, in.texCoord);
+    
+    // Sepia transformation matrix
+    float3 sepia;
+    sepia.r = dot(color.rgb, float3(0.393, 0.769, 0.189));
+    sepia.g = dot(color.rgb, float3(0.349, 0.686, 0.168));
+    sepia.b = dot(color.rgb, float3(0.272, 0.534, 0.131));
+    
+    return float4(sepia, color.a * in.color.a);
+}
+

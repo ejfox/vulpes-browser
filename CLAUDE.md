@@ -68,13 +68,15 @@ xcodebuild -project Vulpes.xcodeproj -scheme Vulpes build
 4. Error shaders loop continuously on error pages
 
 ### Key Files
-- `app/MetalView.swift` - Main rendering view, keyboard handling
+- `app/MetalView.swift` - Main rendering view, keyboard handling, image rendering
 - `app/GLSLTranspiler.swift` - GLSL → Metal shader conversion
 - `app/TransitionManager.swift` - Page transition effects
 - `app/NavigationHistory.swift` - Back/forward history
 - `app/VulpesConfig.swift` - nvim-style dotfile config (~/.config/vulpes/config)
 - `app/VulpesBridge.swift` - Swift wrapper for Zig C API
-- `src/html/text_extractor.zig` - HTML text extraction with link parsing
+- `app/GlyphAtlas.swift` - Text glyph texture atlas
+- `app/ImageAtlas.swift` - Image texture atlas with GPU acceleration
+- `src/html/text_extractor.zig` - HTML text and image extraction with link parsing
 - `shaders/` - GLSL shaders (transitions, errors)
 
 ### Config File (~/.config/vulpes/config)
@@ -99,12 +101,37 @@ Shaders are loaded from `~/.config/ghostty/shaders/` for Ghostty compatibility.
 - **Errors:** `error-404.glsl` (void), `error-500.glsl` (fire)
 - **Custom:** Any Ghostty shader via config
 
+## Image Rendering System
+
+### GPU-Accelerated Architecture
+- **ImageAtlas**: Texture atlas with LRU caching (4K atlas, 100 image cache)
+- **Metal Shaders**: `fragmentShaderImage`, `fragmentShaderImageGrayscale`, `fragmentShaderImageSepia`
+- **Async Loading**: Background image download with progressive enhancement
+- **Smart Packing**: Row-based atlas packing with automatic eviction
+
+### Performance Features
+- Zero-copy texture upload via blit encoder
+- Private GPU memory for optimal rendering
+- Batched draw calls via texture atlas
+- Individual textures for large images (>2048px)
+- Aspect ratio preservation with smart scaling
+
+### Image Extraction
+- Zig parser extracts `<img>` tags from HTML
+- Control character markers (`0x1E`) for inline placement
+- Relative URL resolution against page URL
+- Image list appended to extracted text
+
+### See Also
+- `docs/IMAGE_RENDERING.md` - Detailed documentation
+- `docs/test-images.html` - Test page for image rendering
+
 ## Known Limitations
 
 1. **No JavaScript** - JS-heavy sites (SPAs, Nuxt, React) show empty/minimal content
 2. **No CSS layout** - Text extraction only, no visual styling
 3. **No forms** - Input elements not yet implemented
-4. **No images** - Text-only rendering
+4. **Image rendering** - Basic inline image support with GPU acceleration
 
 ## Next Steps
 
@@ -131,6 +158,6 @@ All Phase 1 milestones done:
 - [x] Error page effects (404, 500)
 - [x] Back/forward navigation
 - [x] URL bar focus (/)
+- [x] Image rendering (GPU-accelerated with shader effects)
 - [ ] HTML form inputs
-- [ ] Image rendering
 - [ ] In-page search

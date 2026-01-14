@@ -747,3 +747,100 @@ test "heading markers" {
     const expected = &[_]u8{ H2_START, 'T', 'i', 't', 'l', 'e', HEADING_END };
     try std.testing.expectEqualStrings(expected, text);
 }
+
+test "image extraction with src" {
+    const html = "<p>Before <img src=\"https://example.com/img.jpg\"> After</p>";
+    const text = try extractText(std.testing.allocator, html);
+    defer std.testing.allocator.free(text);
+
+    // Should contain image marker
+    try std.testing.expect(std.mem.indexOf(u8, text, &[_]u8{IMAGE_MARKER}) != null);
+    // Should contain images section
+    try std.testing.expect(std.mem.indexOf(u8, text, "Images:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "https://example.com/img.jpg") != null);
+}
+
+test "multiple images numbered correctly" {
+    const html = "<img src=\"/a.jpg\"><img src=\"/b.png\"><img src=\"/c.gif\">";
+    const text = try extractText(std.testing.allocator, html);
+    defer std.testing.allocator.free(text);
+
+    // Check for image markers
+    const marker_count = std.mem.count(u8, text, &[_]u8{IMAGE_MARKER});
+    try std.testing.expectEqual(@as(usize, 6), marker_count); // 3 images * 2 markers each
+
+    // Check for numbered references
+    try std.testing.expect(std.mem.indexOf(u8, text, "[1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "[2]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "[3]") != null);
+}
+
+test "image without src attribute" {
+    const html = "<p><img alt=\"no source\"></p>";
+    const text = try extractText(std.testing.allocator, html);
+    defer std.testing.allocator.free(text);
+
+    // Should not contain image markers if no src
+    try std.testing.expect(std.mem.indexOf(u8, text, &[_]u8{IMAGE_MARKER}) == null);
+}
+
+test "extractImgSrc with quoted src" {
+    const tag = "<img src=\"https://example.com/test.jpg\">";
+    const src = extractImgSrc(tag);
+    try std.testing.expect(src != null);
+    try std.testing.expectEqualStrings("https://example.com/test.jpg", src.?);
+}
+
+test "extractImgSrc with single quotes" {
+    const tag = "<img src='https://example.com/test.jpg'>";
+    const src = extractImgSrc(tag);
+    try std.testing.expect(src != null);
+    try std.testing.expectEqualStrings("https://example.com/test.jpg", src.?);
+}
+
+test "extractImgSrc with spaces" {
+    const tag = "<img  src  =  \"https://example.com/test.jpg\"  >";
+    const src = extractImgSrc(tag);
+    try std.testing.expect(src != null);
+    try std.testing.expectEqualStrings("https://example.com/test.jpg", src.?);
+}
+
+test "extractImgSrc with other attributes" {
+    const tag = "<img alt=\"test\" src=\"https://example.com/test.jpg\" width=\"100\">";
+    const src = extractImgSrc(tag);
+    try std.testing.expect(src != null);
+    try std.testing.expectEqualStrings("https://example.com/test.jpg", src.?);
+}
+
+test "image extraction respects MAX_IMAGES limit" {
+    // Create HTML with more than MAX_IMAGES images
+    var html_buf: [2000]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&html_buf);
+    const writer = stream.writer();
+    
+    for (0..MAX_IMAGES + 5) |i| {
+        _ = writer.print("<img src=\"/img{d}.jpg\">", .{i}) catch break;
+    }
+    
+    const html = stream.getWritten();
+    const text = try extractText(std.testing.allocator, html);
+    defer std.testing.allocator.free(text);
+
+    // Should only extract MAX_IMAGES images
+    const lines = std.mem.split(u8, text, "\n");
+    var image_count: usize = 0;
+    var in_images_section = false;
+    
+    var it = lines;
+    while (it.next()) |line| {
+        if (std.mem.eql(u8, line, "Images:")) {
+            in_images_section = true;
+            continue;
+        }
+        if (in_images_section and line.len > 0 and line[0] == '[') {
+            image_count += 1;
+        }
+    }
+    
+    try std.testing.expectEqual(MAX_IMAGES, image_count);
+}

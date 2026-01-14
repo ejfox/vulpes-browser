@@ -233,7 +233,7 @@ pub fn extractText(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
 
                 // Handle <img> tags - extract src and insert image marker
                 if (std.ascii.eqlIgnoreCase(tag_name, "img")) {
-                    if (const img_src = extractImgSrc(html[i..tag_end + 1])) {
+                    if (extractImgSrc(html[i..tag_end + 1])) |img_src| {
                         if (image_count < MAX_IMAGES) {
                             images[image_count] = img_src;
                             // Insert image placeholder with number

@@ -35,6 +35,7 @@ final class ImageAtlas {
     private let maxAtlasSize: Int = 4096  // 4K atlas texture
     private let maxIndividualSize: Int = 2048  // Images larger than this get individual textures
     private let maxCacheSize: Int = 100   // Max number of cached images
+    private let maxConcurrentDownloads: Int = 4  // Limit concurrent downloads
     
     // MARK: - State
     
@@ -52,10 +53,23 @@ final class ImageAtlas {
     private let downloadQueue = DispatchQueue(label: "com.vulpes.imagedownload", qos: .userInitiated, attributes: .concurrent)
     private var pendingDownloads: Set<String> = []
     
+    // Thread-safe access to pendingDownloads
+    private let pendingDownloadsQueue = DispatchQueue(label: "com.vulpes.pendingDownloads")
+    
+    // Reusable command queue for better performance
+    private let uploadQueue: MTLCommandQueue?
+    
     // MARK: - Initialization
     
     init?(device: MTLDevice) {
         self.device = device
+        
+        // Create reusable command queue for uploads
+        self.uploadQueue = device.makeCommandQueue()
+        guard uploadQueue != nil else {
+            print("ImageAtlas: Failed to create command queue")
+            return nil
+        }
         
         // Create initial atlas texture
         guard let texture = createAtlasTexture() else {
@@ -96,8 +110,16 @@ final class ImageAtlas {
         }
         
         // Not cached - trigger async download if not already pending
-        if !pendingDownloads.contains(url) {
-            pendingDownloads.insert(url)
+        var shouldDownload = false
+        pendingDownloadsQueue.sync {
+            // Limit concurrent downloads to prevent resource exhaustion
+            if !pendingDownloads.contains(url) && pendingDownloads.count < maxConcurrentDownloads {
+                pendingDownloads.insert(url)
+                shouldDownload = true
+            }
+        }
+        
+        if shouldDownload {
             downloadImage(url: url)
         }
         
@@ -117,10 +139,18 @@ final class ImageAtlas {
     /// Clear all cached images
     func clearCache() {
         entries.removeAll()
+        pendingDownloadsQueue.sync {
+            pendingDownloads.removeAll()
+        }
         nextX = 0
         nextY = 0
         rowHeight = 0
         print("ImageAtlas: Cache cleared")
+    }
+    
+    /// Cleanup resources
+    deinit {
+        clearCache()
     }
     
     // MARK: - Image Loading
@@ -132,7 +162,7 @@ final class ImageAtlas {
             // Handle relative URLs by checking if it starts with http
             guard let imageURL = self.resolveURL(url) else {
                 print("ImageAtlas: Invalid URL: \(url)")
-                DispatchQueue.main.async {
+                self.pendingDownloadsQueue.async {
                     self.pendingDownloads.remove(url)
                 }
                 return
@@ -140,10 +170,33 @@ final class ImageAtlas {
             
             print("ImageAtlas: Downloading \(imageURL)")
             
-            // Download image data
-            guard let data = try? Data(contentsOf: imageURL) else {
-                print("ImageAtlas: Failed to download: \(url)")
-                DispatchQueue.main.async {
+            // Download image data with timeout
+            var urlRequest = URLRequest(url: imageURL)
+            urlRequest.timeoutInterval = 10.0  // 10 second timeout
+            
+            let semaphore = DispatchSemaphore(value: 0)
+            var downloadedData: Data?
+            var downloadError: Error?
+            
+            let task = URLSession.shared.dataTask(with: urlRequest) { data, response, error in
+                downloadedData = data
+                downloadError = error
+                semaphore.signal()
+            }
+            task.resume()
+            semaphore.wait()
+            
+            if let error = downloadError {
+                print("ImageAtlas: Download error for \(url): \(error.localizedDescription)")
+                self.pendingDownloadsQueue.async {
+                    self.pendingDownloads.remove(url)
+                }
+                return
+            }
+            
+            guard let data = downloadedData else {
+                print("ImageAtlas: No data received for: \(url)")
+                self.pendingDownloadsQueue.async {
                     self.pendingDownloads.remove(url)
                 }
                 return
@@ -152,7 +205,7 @@ final class ImageAtlas {
             // Decode image
             guard let nsImage = NSImage(data: data) else {
                 print("ImageAtlas: Failed to decode image: \(url)")
-                DispatchQueue.main.async {
+                self.pendingDownloadsQueue.async {
                     self.pendingDownloads.remove(url)
                 }
                 return
@@ -161,7 +214,7 @@ final class ImageAtlas {
             // Convert to CGImage
             guard let cgImage = self.cgImage(from: nsImage) else {
                 print("ImageAtlas: Failed to convert image: \(url)")
-                DispatchQueue.main.async {
+                self.pendingDownloadsQueue.async {
                     self.pendingDownloads.remove(url)
                 }
                 return
@@ -170,7 +223,9 @@ final class ImageAtlas {
             // Add to atlas on main queue
             DispatchQueue.main.async {
                 self.addToAtlas(url: url, image: cgImage)
-                self.pendingDownloads.remove(url)
+                self.pendingDownloadsQueue.async {
+                    self.pendingDownloads.remove(url)
+                }
                 
                 // Notify that image is ready (trigger redraw)
                 NotificationCenter.default.post(name: .imageLoaded, object: url)
@@ -247,8 +302,9 @@ final class ImageAtlas {
         }
         
         // Use blit encoder for GPU-side copy (more efficient)
-        guard let commandQueue = device.makeCommandQueue(),
+        guard let commandQueue = uploadQueue,
               let commandBuffer = commandQueue.makeCommandBuffer() else {
+            print("ImageAtlas: Failed to create command buffer for atlas upload")
             return
         }
         
@@ -363,9 +419,10 @@ final class ImageAtlas {
         )
         
         // Blit to private texture
-        guard let commandQueue = device.makeCommandQueue(),
+        guard let commandQueue = uploadQueue,
               let commandBuffer = commandQueue.makeCommandBuffer(),
               let blitEncoder = commandBuffer.makeBlitCommandEncoder() else {
+            print("ImageAtlas: Failed to create command buffer for individual texture")
             return nil
         }
         

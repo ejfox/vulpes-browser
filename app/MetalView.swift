@@ -1529,20 +1529,20 @@ class MetalView: NSView {
             sceneEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: textVertexCount)
         }
 
-        // Draw images from image atlas
+        // Draw images from image atlas (optimized with batching)
         if let imageAtlas = imageAtlas, !imagePlacements.isEmpty {
             sceneEncoder.setRenderPipelineState(imagePipelineState)
             sceneEncoder.setVertexBuffer(uniformBuffer, offset: 0, index: 1)
+            
+            // Group images by texture for batched rendering
+            var atlasImages: [Vertex] = []
+            var individualImages: [(texture: MTLTexture, vertices: [Vertex])] = []
             
             for placement in imagePlacements {
                 // Check if image is loaded
                 guard placement.imageIndex < extractedImages.count else { continue }
                 let imageURL = extractedImages[placement.imageIndex]
                 guard let entry = imageAtlas.entry(for: imageURL) else { continue }
-                
-                // Use atlas texture or individual texture
-                let texture = entry.texture ?? imageAtlas.getAtlasTexture()
-                guard let texture = texture else { continue }
                 
                 // Calculate actual image size preserving aspect ratio
                 let aspectRatio = entry.size.width / entry.size.height
@@ -1553,16 +1553,46 @@ class MetalView: NSView {
                 let x = placement.x * Float(metalLayer.contentsScale)
                 let y = (placement.y - scrollOffset) * Float(metalLayer.contentsScale)
                 
+                let minX = Float(entry.uvRect.minX)
+                let maxX = Float(entry.uvRect.maxX)
+                let minY = Float(entry.uvRect.minY)
+                let maxY = Float(entry.uvRect.maxY)
+                
                 let vertices: [Vertex] = [
-                    Vertex(position: SIMD2<Float>(x, y), texCoord: SIMD2<Float>(Float(entry.uvRect.minX), Float(entry.uvRect.maxY)), color: SIMD4<Float>(1, 1, 1, 1)),
-                    Vertex(position: SIMD2<Float>(x + width, y), texCoord: SIMD2<Float>(Float(entry.uvRect.maxX), Float(entry.uvRect.maxY)), color: SIMD4<Float>(1, 1, 1, 1)),
-                    Vertex(position: SIMD2<Float>(x, y + height), texCoord: SIMD2<Float>(Float(entry.uvRect.minX), Float(entry.uvRect.minY)), color: SIMD4<Float>(1, 1, 1, 1)),
-                    Vertex(position: SIMD2<Float>(x + width, y), texCoord: SIMD2<Float>(Float(entry.uvRect.maxX), Float(entry.uvRect.maxY)), color: SIMD4<Float>(1, 1, 1, 1)),
-                    Vertex(position: SIMD2<Float>(x + width, y + height), texCoord: SIMD2<Float>(Float(entry.uvRect.maxX), Float(entry.uvRect.minY)), color: SIMD4<Float>(1, 1, 1, 1)),
-                    Vertex(position: SIMD2<Float>(x, y + height), texCoord: SIMD2<Float>(Float(entry.uvRect.minX), Float(entry.uvRect.minY)), color: SIMD4<Float>(1, 1, 1, 1)),
+                    Vertex(position: SIMD2<Float>(x, y), texCoord: SIMD2<Float>(minX, maxY), color: SIMD4<Float>(1, 1, 1, 1)),
+                    Vertex(position: SIMD2<Float>(x + width, y), texCoord: SIMD2<Float>(maxX, maxY), color: SIMD4<Float>(1, 1, 1, 1)),
+                    Vertex(position: SIMD2<Float>(x, y + height), texCoord: SIMD2<Float>(minX, minY), color: SIMD4<Float>(1, 1, 1, 1)),
+                    Vertex(position: SIMD2<Float>(x + width, y), texCoord: SIMD2<Float>(maxX, maxY), color: SIMD4<Float>(1, 1, 1, 1)),
+                    Vertex(position: SIMD2<Float>(x + width, y + height), texCoord: SIMD2<Float>(maxX, minY), color: SIMD4<Float>(1, 1, 1, 1)),
+                    Vertex(position: SIMD2<Float>(x, y + height), texCoord: SIMD2<Float>(minX, minY), color: SIMD4<Float>(1, 1, 1, 1)),
                 ]
                 
-                // Create vertex buffer for this image
+                // Group by texture
+                if let individualTexture = entry.texture {
+                    individualImages.append((texture: individualTexture, vertices: vertices))
+                } else {
+                    atlasImages.append(contentsOf: vertices)
+                }
+            }
+            
+            // Batch draw all atlas images in a single call
+            if !atlasImages.isEmpty, let atlasTexture = imageAtlas.getAtlasTexture() {
+                guard let batchBuffer = device.makeBuffer(
+                    bytes: atlasImages,
+                    length: MemoryLayout<Vertex>.stride * atlasImages.count,
+                    options: .storageModeShared
+                ) else {
+                    print("MetalView: Failed to create batch buffer for atlas images")
+                    return
+                }
+                
+                sceneEncoder.setVertexBuffer(batchBuffer, offset: 0, index: 0)
+                sceneEncoder.setFragmentTexture(atlasTexture, index: 0)
+                sceneEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: atlasImages.count)
+            }
+            
+            // Draw individual textures (one call per texture)
+            for (texture, vertices) in individualImages {
                 guard let imageBuffer = device.makeBuffer(
                     bytes: vertices,
                     length: MemoryLayout<Vertex>.stride * vertices.count,

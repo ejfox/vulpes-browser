@@ -139,6 +139,7 @@ Shaders are loaded from `~/.config/ghostty/shaders/` for Ghostty compatibility.
 2. **Image rendering** - Basic image support
 3. **Better empty page handling** - Show title for JS-only sites
 4. **In-page search** - Find text with highlighting
+5. **History breadcrumbs** - Show navigation history as breadcrumbs at bottom of screen (page titles, fuzzy de-duping)
 
 ## Phase 1 Complete ✓
 

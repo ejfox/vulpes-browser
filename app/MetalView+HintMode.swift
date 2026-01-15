@@ -217,9 +217,9 @@ extension MetalView {
                 guard let entry = atlas.entry(for: glyph, font: font) else { continue }
 
                 let x1 = penX + Float(entry.bearing.x)
-                let y1 = hintY - Float(entry.bearing.y)
+                let y1 = hintY - Float(entry.bearing.y) - Float(entry.size.height)
                 let x2 = x1 + Float(entry.size.width)
-                let y2 = y1 + Float(entry.size.height)
+                let y2 = hintY - Float(entry.bearing.y)
 
                 let u1 = Float(entry.uvRect.minX)
                 let v1 = Float(entry.uvRect.maxY)  // Flipped for correct orientation

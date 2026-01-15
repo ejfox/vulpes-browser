@@ -114,8 +114,9 @@ pub const Client = struct {
     /// Caller must free response.body with the same allocator.
     ///
     /// Uses low-level request API for streaming - optimized for first-byte latency.
+    /// NOTE: Currently only GET is implemented. POST/headers support is planned.
     pub fn fetch(self: *Self, url: []const u8, options: RequestOptions) !Response {
-        _ = options; // TODO: use method from options
+        _ = options; // GET-only for now; POST/headers planned for forms support
 
         const uri = Uri.parse(url) catch return HttpError.InvalidUrl;
 

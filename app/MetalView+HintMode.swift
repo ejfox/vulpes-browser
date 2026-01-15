@@ -222,9 +222,9 @@ extension MetalView {
                 let y2 = y1 + Float(entry.size.height)
 
                 let u1 = Float(entry.uvRect.minX)
-                let v1 = Float(entry.uvRect.minY)
+                let v1 = Float(entry.uvRect.maxY)  // Flipped for correct orientation
                 let u2 = Float(entry.uvRect.maxX)
-                let v2 = Float(entry.uvRect.maxY)
+                let v2 = Float(entry.uvRect.minY)  // Flipped for correct orientation
 
                 vertices.append(Vertex(position: SIMD2<Float>(x1, y1), texCoord: SIMD2<Float>(u1, v1), color: textColor))
                 vertices.append(Vertex(position: SIMD2<Float>(x2, y1), texCoord: SIMD2<Float>(u2, v1), color: textColor))

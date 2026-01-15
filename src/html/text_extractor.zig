@@ -15,6 +15,8 @@ const std = @import("std");
 
 /// Maximum number of links to track
 const MAX_LINKS = 99;
+/// Maximum number of images to track
+const MAX_IMAGES = 50;
 
 /// Control characters for marking link text
 /// These are parsed by Swift to apply blue color
@@ -35,6 +37,7 @@ const H2_START: u8 = 0x1A; // SUB - Substitute
 const H3_START: u8 = 0x1B; // ESC - Escape
 const H4_START: u8 = 0x1C; // FS - File Separator
 const HEADING_END: u8 = 0x1D; // GS - Group Separator
+const IMAGE_MARKER: u8 = 0x1E; // RS - Record Separator (marks image placeholder)
 
 /// Tags whose content should be completely skipped
 const skip_tags = [_][]const u8{
@@ -53,6 +56,7 @@ const skip_tags = [_][]const u8{
 /// Extract visible text from HTML content.
 /// Caller owns returned slice and must free with same allocator.
 /// Links are extracted and appended at the end as numbered references.
+/// Images are marked with IMAGE_MARKER control character and listed separately.
 pub fn extractText(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
     var result: std.ArrayListUnmanaged(u8) = .empty;
     errdefer result.deinit(allocator);
@@ -60,6 +64,10 @@ pub fn extractText(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
     // Track extracted links
     var links: [MAX_LINKS][]const u8 = undefined;
     var link_count: usize = 0;
+
+    // Track extracted images
+    var images: [MAX_IMAGES][]const u8 = undefined;
+    var image_count: usize = 0;
 
     // Track current link state
     var in_link: bool = false;
@@ -223,6 +231,24 @@ pub fn extractText(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
                     }
                 }
 
+                // Handle <img> tags - extract src and insert image marker
+                if (std.ascii.eqlIgnoreCase(tag_name, "img")) {
+                    if (extractImgSrc(html[i..tag_end + 1])) |img_src| {
+                        if (image_count < MAX_IMAGES) {
+                            images[image_count] = img_src;
+                            // Insert image placeholder with number
+                            try result.append(allocator, IMAGE_MARKER);
+                            var num_buf: [3]u8 = undefined;
+                            const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{image_count + 1}) catch "?";
+                            try result.appendSlice(allocator, num_str);
+                            try result.append(allocator, IMAGE_MARKER);
+                            image_count += 1;
+                            try result.append(allocator, ' ');
+                            last_was_space = true;
+                        }
+                    }
+                }
+
                 if (isHeadingTag(tag_name)) {
                     const heading_start = headingStartMarker(tag_name) orelse HEADING_END;
                     try result.append(allocator, heading_start);
@@ -336,6 +362,20 @@ pub fn extractText(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
         }
     }
 
+    // Append images section if we found any
+    if (image_count > 0) {
+        try result.appendSlice(allocator, "\n---\nImages:\n");
+        for (images[0..image_count], 1..) |src, num| {
+            try result.append(allocator, '[');
+            var num_buf: [3]u8 = undefined;
+            const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{num}) catch "?";
+            try result.appendSlice(allocator, num_str);
+            try result.appendSlice(allocator, "] ");
+            try result.appendSlice(allocator, src);
+            try result.append(allocator, '\n');
+        }
+    }
+
     return result.toOwnedSlice(allocator);
 }
 
@@ -364,6 +404,53 @@ fn extractHref(tag: []const u8) ?[]const u8 {
             tag[i + 4] == '=')
         {
             i += 5;
+
+            // Skip whitespace
+            while (i < tag.len and (tag[i] == ' ' or tag[i] == '\t')) {
+                i += 1;
+            }
+
+            if (i >= tag.len) return null;
+
+            // Check for quote
+            const quote = tag[i];
+            if (quote == '"' or quote == '\'') {
+                i += 1;
+                const start = i;
+                while (i < tag.len and tag[i] != quote) {
+                    i += 1;
+                }
+                if (i > start) {
+                    return tag[start..i];
+                }
+            } else {
+                // Unquoted value - ends at space or >
+                const start = i;
+                while (i < tag.len and tag[i] != ' ' and tag[i] != '>' and tag[i] != '\t') {
+                    i += 1;
+                }
+                if (i > start) {
+                    return tag[start..i];
+                }
+            }
+            return null;
+        }
+        i += 1;
+    }
+    return null;
+}
+
+/// Extract src attribute value from an <img> tag
+fn extractImgSrc(tag: []const u8) ?[]const u8 {
+    // Look for src= (case insensitive)
+    var i: usize = 0;
+    while (i + 4 < tag.len) {
+        if ((tag[i] == 's' or tag[i] == 'S') and
+            (tag[i + 1] == 'r' or tag[i + 1] == 'R') and
+            (tag[i + 2] == 'c' or tag[i + 2] == 'C') and
+            tag[i + 3] == '=')
+        {
+            i += 4;
 
             // Skip whitespace
             while (i < tag.len and (tag[i] == ' ' or tag[i] == '\t')) {
@@ -659,4 +746,101 @@ test "heading markers" {
 
     const expected = &[_]u8{ H2_START, 'T', 'i', 't', 'l', 'e', HEADING_END };
     try std.testing.expectEqualStrings(expected, text);
+}
+
+test "image extraction with src" {
+    const html = "<p>Before <img src=\"https://example.com/img.jpg\"> After</p>";
+    const text = try extractText(std.testing.allocator, html);
+    defer std.testing.allocator.free(text);
+
+    // Should contain image marker
+    try std.testing.expect(std.mem.indexOf(u8, text, &[_]u8{IMAGE_MARKER}) != null);
+    // Should contain images section
+    try std.testing.expect(std.mem.indexOf(u8, text, "Images:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "https://example.com/img.jpg") != null);
+}
+
+test "multiple images numbered correctly" {
+    const html = "<img src=\"/a.jpg\"><img src=\"/b.png\"><img src=\"/c.gif\">";
+    const text = try extractText(std.testing.allocator, html);
+    defer std.testing.allocator.free(text);
+
+    // Check for image markers
+    const marker_count = std.mem.count(u8, text, &[_]u8{IMAGE_MARKER});
+    try std.testing.expectEqual(@as(usize, 6), marker_count); // 3 images * 2 markers each
+
+    // Check for numbered references
+    try std.testing.expect(std.mem.indexOf(u8, text, "[1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "[2]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "[3]") != null);
+}
+
+test "image without src attribute" {
+    const html = "<p><img alt=\"no source\"></p>";
+    const text = try extractText(std.testing.allocator, html);
+    defer std.testing.allocator.free(text);
+
+    // Should not contain image markers if no src
+    try std.testing.expect(std.mem.indexOf(u8, text, &[_]u8{IMAGE_MARKER}) == null);
+}
+
+test "extractImgSrc with quoted src" {
+    const tag = "<img src=\"https://example.com/test.jpg\">";
+    const src = extractImgSrc(tag);
+    try std.testing.expect(src != null);
+    try std.testing.expectEqualStrings("https://example.com/test.jpg", src.?);
+}
+
+test "extractImgSrc with single quotes" {
+    const tag = "<img src='https://example.com/test.jpg'>";
+    const src = extractImgSrc(tag);
+    try std.testing.expect(src != null);
+    try std.testing.expectEqualStrings("https://example.com/test.jpg", src.?);
+}
+
+test "extractImgSrc with spaces" {
+    const tag = "<img  src  =  \"https://example.com/test.jpg\"  >";
+    const src = extractImgSrc(tag);
+    try std.testing.expect(src != null);
+    try std.testing.expectEqualStrings("https://example.com/test.jpg", src.?);
+}
+
+test "extractImgSrc with other attributes" {
+    const tag = "<img alt=\"test\" src=\"https://example.com/test.jpg\" width=\"100\">";
+    const src = extractImgSrc(tag);
+    try std.testing.expect(src != null);
+    try std.testing.expectEqualStrings("https://example.com/test.jpg", src.?);
+}
+
+test "image extraction respects MAX_IMAGES limit" {
+    // Create HTML with more than MAX_IMAGES images
+    var html_buf: [2000]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&html_buf);
+    const writer = stream.writer();
+    
+    for (0..MAX_IMAGES + 5) |i| {
+        _ = writer.print("<img src=\"/img{d}.jpg\">", .{i}) catch break;
+    }
+    
+    const html = stream.getWritten();
+    const text = try extractText(std.testing.allocator, html);
+    defer std.testing.allocator.free(text);
+
+    // Should only extract MAX_IMAGES images
+    const lines = std.mem.split(u8, text, "\n");
+    var image_count: usize = 0;
+    var in_images_section = false;
+    
+    var it = lines;
+    while (it.next()) |line| {
+        if (std.mem.eql(u8, line, "Images:")) {
+            in_images_section = true;
+            continue;
+        }
+        if (in_images_section and line.len > 0 and line[0] == '[') {
+            image_count += 1;
+        }
+    }
+    
+    try std.testing.expectEqual(MAX_IMAGES, image_count);
 }

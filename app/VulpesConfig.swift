@@ -39,6 +39,9 @@ class VulpesConfig {
     var particlesEnabled: Bool = true
     var particleCount: Int = 150
 
+    // Page transitions
+    var transitionsEnabled: Bool = false  // Disabled by default - cool but not for everyday
+
     // Home page
     var homePage: String = "https://ejfox.com"
 
@@ -126,6 +129,10 @@ class VulpesConfig {
         # Particle effects on link clicks
         particles_enabled = true
         particle_count = 150
+
+        # Page transition effects (70s wobble, glitch)
+        # Cool but not for everyday use
+        transitions_enabled = false
         """
 
         try? defaultConfig.write(to: configFile, atomically: true, encoding: .utf8)
@@ -210,6 +217,9 @@ class VulpesConfig {
 
         case "particle_count":
             particleCount = Int(value) ?? particleCount
+
+        case "transitions_enabled":
+            transitionsEnabled = parseBool(value)
 
         case "openrouter_enabled":
             openRouterEnabled = parseBool(value)

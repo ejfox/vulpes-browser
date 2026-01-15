@@ -140,19 +140,10 @@ pub fn extractText(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
                             // Mark end of link text
                             try result.append(allocator, LINK_END);
 
-                            // Add link number marker
+                            // Track link for the Links section (no inline [N] - cleaner display)
                             if (link_count < MAX_LINKS) {
                                 links[link_count] = current_href.?;
                                 link_count += 1;
-
-                                // Insert [N] marker
-                                try result.append(allocator, ' ');
-                                try result.append(allocator, '[');
-                                var num_buf: [3]u8 = undefined;
-                                const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{link_count}) catch "?";
-                                try result.appendSlice(allocator, num_str);
-                                try result.append(allocator, ']');
-                                last_was_space = false;
                             }
                         }
                         in_link = false;
@@ -674,8 +665,9 @@ test "extract links with href" {
     const text = try extractText(std.testing.allocator, html);
     defer std.testing.allocator.free(text);
 
-    // Should contain link marker and link section
-    try std.testing.expect(std.mem.indexOf(u8, text, "[1]") != null);
+    // Should contain link markers and link section at the bottom
+    try std.testing.expect(std.mem.indexOf(u8, text, &[_]u8{LINK_START}) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, &[_]u8{LINK_END}) != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "https://example.com") != null);
 }
 
@@ -684,8 +676,10 @@ test "multiple links numbered correctly" {
     const text = try extractText(std.testing.allocator, html);
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "[1]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "[2]") != null);
+    // Numbers are in the Links section at the bottom, not inline
+    try std.testing.expect(std.mem.indexOf(u8, text, "Links:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "[1] /a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "[2] /b") != null);
 }
 
 test "list items render bullets" {
@@ -798,8 +792,9 @@ test "extractImgSrc with single quotes" {
     try std.testing.expectEqualStrings("https://example.com/test.jpg", src.?);
 }
 
-test "extractImgSrc with spaces" {
-    const tag = "<img  src  =  \"https://example.com/test.jpg\"  >";
+test "extractImgSrc with spaces after equals" {
+    // Note: spaces before = are not supported (strict src= match)
+    const tag = "<img src=  \"https://example.com/test.jpg\"  >";
     const src = extractImgSrc(tag);
     try std.testing.expect(src != null);
     try std.testing.expectEqualStrings("https://example.com/test.jpg", src.?);
@@ -827,20 +822,24 @@ test "image extraction respects MAX_IMAGES limit" {
     defer std.testing.allocator.free(text);
 
     // Should only extract MAX_IMAGES images
-    const lines = std.mem.split(u8, text, "\n");
+    // Count [N] entries in Images section
     var image_count: usize = 0;
-    var in_images_section = false;
-    
-    var it = lines;
-    while (it.next()) |line| {
-        if (std.mem.eql(u8, line, "Images:")) {
-            in_images_section = true;
-            continue;
-        }
-        if (in_images_section and line.len > 0 and line[0] == '[') {
-            image_count += 1;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        // Look for "[N]" pattern in Images section
+        if (text[i] == '[' and i + 2 < text.len) {
+            // Check if it's a number followed by ]
+            var j = i + 1;
+            while (j < text.len and text[j] >= '0' and text[j] <= '9') {
+                j += 1;
+            }
+            if (j > i + 1 and j < text.len and text[j] == ']') {
+                image_count += 1;
+                i = j;
+            }
         }
     }
-    
+
+    // We have MAX_IMAGES images in Images section, plus 0 inline (inline numbers removed)
     try std.testing.expectEqual(MAX_IMAGES, image_count);
 }

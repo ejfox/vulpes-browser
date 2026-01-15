@@ -296,6 +296,7 @@ class MetalView: NSView {
         let config = VulpesConfig.shared
         bloomEnabled = config.bloomEnabled
         scrollSpeed = config.scrollSpeed
+        TransitionManager.shared.transitionsEnabled = config.transitionsEnabled
 
         // Create post-process uniform buffer for custom shaders
         postProcessUniformBuffer = device.makeBuffer(

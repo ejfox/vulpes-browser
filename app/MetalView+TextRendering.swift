@@ -109,12 +109,32 @@ extension MetalView {
         var currentLineHeight: Float = baseLineHeight
         var extraSpacingAfterHeading: Float = 0
 
-        // Scroll offset
-        let scrollAdjust = -scrollOffset * Float(scale)
+        // Note: Scroll offset is now applied in the vertex shader via uniforms
+        // This allows smooth scrolling without rebuilding all vertices
 
-        // Colors
-        let normalColor = SIMD4<Float>(0.9, 0.9, 0.9, 1.0)
-        let linkColor = SIMD4<Float>(0.4, 0.6, 1.0, 1.0)
+        // Colors - use CSS page style if available, otherwise defaults
+        let config = VulpesConfig.shared
+
+        // Text color priority: 1) Config override, 2) CSS page style, 3) Default
+        let normalColor: SIMD4<Float>
+        if let override = config.textColorOverride {
+            normalColor = SIMD4<Float>(override.r, override.g, override.b, 1.0)
+        } else if config.useCssColors, let cssText = pageStyle.textColor {
+            normalColor = SIMD4<Float>(cssText.r, cssText.g, cssText.b, 1.0)
+        } else {
+            let c = config.textColor
+            normalColor = SIMD4<Float>(c.r, c.g, c.b, 1.0)
+        }
+
+        // Link color priority: 1) Config, 2) CSS page style, 3) Default
+        let linkColor: SIMD4<Float>
+        if config.useCssColors, let cssLink = pageStyle.linkColor {
+            linkColor = SIMD4<Float>(cssLink.r, cssLink.g, cssLink.b, 1.0)
+        } else {
+            let c = config.linkColor
+            linkColor = SIMD4<Float>(c.r, c.g, c.b, 1.0)
+        }
+
         let focusedLinkColor = SIMD4<Float>(1.0, 0.8, 0.2, 1.0)
         var currentColor = normalColor
         var currentLinkIndex = -1
@@ -223,9 +243,9 @@ extension MetalView {
 
         func appendGlyph(_ entry: GlyphAtlas.GlyphEntry, color: SIMD4<Float>) {
             let x1 = penX + Float(entry.bearing.x)
-            let y1 = penY - Float(entry.bearing.y) - Float(entry.size.height) + scrollAdjust
+            let y1 = penY - Float(entry.bearing.y) - Float(entry.size.height)
             let x2 = x1 + Float(entry.size.width)
-            let y2 = penY - Float(entry.bearing.y) + scrollAdjust
+            let y2 = penY - Float(entry.bearing.y)
 
             let u0 = Float(entry.uvRect.minX)
             let u1 = Float(entry.uvRect.maxX)
@@ -326,16 +346,29 @@ extension MetalView {
                             penY += currentLineHeight
                         }
 
+                        // Check if image is cached to get real dimensions
+                        let imageURL = extractedImages[imageIndex]
+                        let aspectRatio: Float
+                        if let entry = imageAtlas?.entry(for: imageURL) {
+                            // Use real aspect ratio from cached image
+                            aspectRatio = Float(entry.size.width / entry.size.height)
+                        } else {
+                            // Estimate 4:3 landscape until image loads
+                            aspectRatio = 4.0 / 3.0
+                        }
+
+                        let imageHeight = desiredWidth / aspectRatio
+
                         let placement = ImagePlacement(
                             imageIndex: imageIndex,
                             x: penX / Float(scale),
                             y: penY / Float(scale),
                             width: desiredWidth / Float(scale),
-                            height: desiredWidth / Float(scale) * 0.75
+                            height: imageHeight / Float(scale)
                         )
                         imagePlacements.append(placement)
 
-                        penY += desiredWidth * 0.75
+                        penY += imageHeight
                         penY += currentLineHeight * 0.5
                         penX = lineStartX()
                     }
@@ -437,6 +470,10 @@ extension MetalView {
 
         // Track content height for scroll bounds
         contentHeight = penY / Float(scale)
+        let maxScroll = max(0, contentHeight - Float(bounds.height) + 40)
+        if scrollOffset > maxScroll {
+            scrollOffset = maxScroll
+        }
 
         guard !vertices.isEmpty else {
             textVertexCount = 0

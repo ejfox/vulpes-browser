@@ -33,6 +33,8 @@ struct Vertex {
 // Must match Shaders.metal Uniforms struct
 struct Uniforms {
     var viewportSize: SIMD2<Float>
+    var scrollOffset: Float
+    var _padding: Float = 0
 }
 
 // For custom GLSL shaders (Ghostty/Shadertoy compatibility)
@@ -88,7 +90,7 @@ class MetalView: NSView {
 
     // Offscreen render target for two-pass bloom
     var offscreenTexture: MTLTexture?
-    var bloomEnabled: Bool = true
+    var bloomEnabled: Bool = false  // Disabled by default for sharp text
 
     // Post-process uniforms for custom shaders (Shadertoy/Ghostty compatibility)
     var postProcessUniformBuffer: MTLBuffer?
@@ -115,12 +117,16 @@ class MetalView: NSView {
     // Current displayed text content
     var displayedText: String = "Loading..."
     var currentURL: String = ""
+    var baseURLForCurrentPage: URL?
 
     // Extracted links for navigation
     var extractedLinks: [String] = []
-    
+
     // Extracted images for rendering
     var extractedImages: [String] = []
+
+    // CSS-extracted page style (colors)
+    var pageStyle: VulpesBridge.PageStyle = .default
 
     // Image placement data (position and size for each image)
     // ImagePlacement struct is defined in MetalView+TextRendering.swift
@@ -157,6 +163,7 @@ class MetalView: NSView {
     // Callback when URL changes (for updating URL bar)
     var onURLChange: ((String) -> Void)?
     var onContentLoaded: ((String, String) -> Void)?
+    var onScrollChange: ((Float, Float) -> Void)?
 
     // Callback to focus URL bar
     var onRequestURLBarFocus: (() -> Void)?
@@ -165,6 +172,9 @@ class MetalView: NSView {
     var scrollOffset: Float = 0.0
     var contentHeight: Float = 0.0  // Total height of rendered content
     var scrollSpeed: Float = 40.0   // Pixels per j/k press (configurable)
+    var scrollVelocity: Float = 0.0
+    var scrollAnimator: Timer?
+    var lastScrollUpdate: CFAbsoluteTime = 0
 
     // Key sequence tracking (for gg, etc.)
     private var lastKeyChar: String = ""
@@ -178,8 +188,6 @@ class MetalView: NSView {
     var currentHttpError: Int = 0  // 0 = no error, 404/500/etc = error
     var errorShaderStartTime: CFAbsoluteTime = 0
 
-    // Simple render timer to ensure the first frame is drawn.
-    private var renderTimer: Timer?
     private var configObserver: NSObjectProtocol?
 
     // MARK: - Layer-Backed View Setup
@@ -251,12 +259,14 @@ class MetalView: NSView {
         // Try to load custom GLSL shader if configured
         loadCustomShader()
         
-        // Listen for image load notifications to trigger redraw
+        // Listen for image load notifications to re-layout and redraw
+        // Re-layout is needed because now we know the actual image dimensions
         NotificationCenter.default.addObserver(
             forName: .imageLoaded,
             object: nil,
             queue: .main
         ) { [weak self] _ in
+            self?.updateTextDisplay()
             self?.needsDisplay = true
         }
 
@@ -284,6 +294,7 @@ class MetalView: NSView {
             NotificationCenter.default.removeObserver(observer)
         }
     }
+
 
     /// Apply settings from VulpesConfig
     private func applyConfig() {
@@ -362,7 +373,6 @@ class MetalView: NSView {
         setupTestGeometry()
 
         print("MetalView: Ready - bounds: \(bounds), drawableSize: \(metalLayer.drawableSize)")
-        startRenderTimer()
         needsDisplay = true
         render()
 
@@ -372,10 +382,6 @@ class MetalView: NSView {
 
     override func viewWillMove(toWindow newWindow: NSWindow?) {
         super.viewWillMove(toWindow: newWindow)
-
-        if newWindow == nil {
-            stopRenderTimer()
-        }
     }
 
     override var acceptsFirstResponder: Bool {
@@ -388,19 +394,6 @@ class MetalView: NSView {
         render()
     }
 
-    private func startRenderTimer() {
-        guard renderTimer == nil else { return }
-
-        renderTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            self?.render()
-        }
-        renderTimer?.tolerance = 1.0 / 120.0
-    }
-
-    private func stopRenderTimer() {
-        renderTimer?.invalidate()
-        renderTimer = nil
-    }
 
     // MARK: - Keyboard Event Handling
     //
@@ -629,13 +622,28 @@ class MetalView: NSView {
         }
 
         // Apply scroll (natural scrolling: positive delta = scroll up = content goes down)
-        scrollOffset = max(0, scrollOffset - deltaY)
+        let offsetDelta = -deltaY
 
-        // Clamp to content bounds
-        let maxScroll = max(0, contentHeight - Float(bounds.height) + 40)
-        scrollOffset = min(scrollOffset, maxScroll)
+        if event.hasPreciseScrollingDeltas {
+            if event.scrollingPhase == .began {
+                scrollVelocity = 0
+                stopScrollAnimator()
+            }
 
-        updateTextDisplay()
+            applyDirectScroll(offsetDelta)
+
+            if event.momentumPhase == .ended {
+                scrollVelocity = 0
+                stopScrollAnimator()
+            }
+            return
+        }
+
+        if VulpesConfig.shared.smoothScrolling {
+            applyInertialImpulse(offsetDelta)
+        } else {
+            applyDirectScroll(offsetDelta)
+        }
     }
 
     // MARK: - Text Input Client

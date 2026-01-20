@@ -23,6 +23,8 @@ class MainWindow: NSWindow, NSTextFieldDelegate, NSToolbarDelegate {
     // Status bar for tabs (tmux-style)
     private var statusBar: NSVisualEffectView!
     private var statusLabel: NSTextField!
+    private var statusBarHeightConstraint: NSLayoutConstraint?
+    private var statusBarHideTimer: Timer?
     private let statusBarHeight: CGFloat = 22.0
 
     private struct BrowserTab {
@@ -122,7 +124,7 @@ class MainWindow: NSWindow, NSTextFieldDelegate, NSToolbarDelegate {
         visualEffect.state = .active
         contentView.addSubview(visualEffect)
 
-        // Create status bar for tabs
+        // Create status bar (tmux-style info line)
         statusBar = NSVisualEffectView(frame: .zero)
         statusBar.translatesAutoresizingMaskIntoConstraints = false
         statusBar.material = .hudWindow
@@ -144,20 +146,29 @@ class MainWindow: NSWindow, NSTextFieldDelegate, NSToolbarDelegate {
         // Add views to content view (Metal view on top of blur)
         contentView.addSubview(metalView)
 
+        // Get the content layout guide for positioning below toolbar
+        // The content layout guide provides the safe area below the title bar
+        let layoutGuide = contentLayoutGuide as! NSLayoutGuide
+
+        let statusBarHeightConstraint = statusBar.heightAnchor.constraint(equalToConstant: statusBarHeight)
+        self.statusBarHeightConstraint = statusBarHeightConstraint
+
         NSLayoutConstraint.activate([
+            // Status bar goes at the BOTTOM (tmux-style)
             statusBar.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
             statusBar.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
-            statusBar.topAnchor.constraint(equalTo: contentView.topAnchor),
-            statusBar.heightAnchor.constraint(equalToConstant: statusBarHeight),
+            statusBar.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+            statusBarHeightConstraint,
 
             statusLabel.leadingAnchor.constraint(equalTo: statusBar.leadingAnchor, constant: 12),
             statusLabel.trailingAnchor.constraint(equalTo: statusBar.trailingAnchor, constant: -12),
             statusLabel.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor),
 
+            // Metal view fills the content area below toolbar, above status bar
             metalView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
             metalView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
-            metalView.topAnchor.constraint(equalTo: statusBar.bottomAnchor),
-            metalView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+            metalView.topAnchor.constraint(equalTo: layoutGuide.topAnchor),
+            metalView.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
         ])
 
         // Update URL bar when MetalView navigates
@@ -167,6 +178,10 @@ class MainWindow: NSWindow, NSTextFieldDelegate, NSToolbarDelegate {
 
         metalView.onContentLoaded = { [weak self] url, text in
             self?.updateActiveTabContent(url: url, text: text)
+        }
+
+        metalView.onScrollChange = { [weak self] _, _ in
+            self?.updateStatusBar()
         }
 
         // Focus URL bar when Tab cycles past last link
@@ -181,6 +196,15 @@ class MainWindow: NSWindow, NSTextFieldDelegate, NSToolbarDelegate {
             queue: .main
         ) { [weak self] _ in
             self?.focusURLBarWithAnimation()
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: .vulpesConfigReloaded,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.applyStatusBarVisibility(animated: false)
+            self?.updateStatusBar()
         }
 
         createInitialTab()
@@ -437,27 +461,76 @@ class MainWindow: NSWindow, NSTextFieldDelegate, NSToolbarDelegate {
     }
 
     private func updateStatusBar() {
-        let attributed = NSMutableAttributedString()
-        let inactiveColor = NSColor(white: 0.7, alpha: 0.8)
-        let activeColor = NSColor(white: 1.0, alpha: 0.95)
-        let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-
-        for (index, tab) in tabs.enumerated() {
-            let isActive = index == activeTabIndex
-            let color = isActive ? activeColor : inactiveColor
-            let title = tab.displayTitle.isEmpty ? "New Tab" : tab.displayTitle
-            let text = "[\(index + 1)] \(title)"
-            let attrs: [NSAttributedString.Key: Any] = [
-                .font: font,
-                .foregroundColor: color,
-            ]
-            attributed.append(NSAttributedString(string: text, attributes: attrs))
-            if index < tabs.count - 1 {
-                attributed.append(NSAttributedString(string: "  ", attributes: attrs))
-            }
+        guard activeTabIndex >= 0 && activeTabIndex < tabs.count else {
+            statusLabel.stringValue = ""
+            return
         }
 
-        statusLabel.attributedStringValue = attributed
+        let tab = tabs[activeTabIndex]
+        let title = tab.displayTitle.isEmpty ? tab.title : tab.displayTitle
+        let url = tab.url
+        let linkCount = metalView.extractedLinks.count
+
+        let maxScroll = max(0, metalView.contentHeight - Float(metalView.bounds.height) + 40)
+        let scrollPercent: Int
+        if maxScroll <= 0 {
+            scrollPercent = 100
+        } else {
+            scrollPercent = Int(round((metalView.scrollOffset / maxScroll) * 100))
+        }
+
+        let values: [String: String] = [
+            "title": title.isEmpty ? "New Tab" : title,
+            "url": url,
+            "scroll": "\(max(0, min(scrollPercent, 100)))%",
+            "links": "\(linkCount)",
+        ]
+
+        let template = VulpesConfig.shared.statusBarTemplate
+        statusLabel.stringValue = renderStatusTemplate(template, values: values)
+        handleStatusBarActivity()
+    }
+
+    private func renderStatusTemplate(_ template: String, values: [String: String]) -> String {
+        var result = template
+        for (key, value) in values {
+            result = result.replacingOccurrences(of: "{{\(key)}}", with: value)
+        }
+        return result
+    }
+
+    private func handleStatusBarActivity() {
+        if VulpesConfig.shared.statusBarAlwaysVisible {
+            applyStatusBarVisibility(animated: false)
+            return
+        }
+
+        applyStatusBarVisibility(animated: true)
+        statusBarHideTimer?.invalidate()
+        statusBarHideTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { [weak self] _ in
+            self?.applyStatusBarVisibility(animated: true, forceHidden: true)
+        }
+    }
+
+    private func applyStatusBarVisibility(animated: Bool, forceHidden: Bool = false) {
+        let alwaysVisible = VulpesConfig.shared.statusBarAlwaysVisible
+        let shouldShow = alwaysVisible ? true : !forceHidden
+        let targetHeight: CGFloat = shouldShow ? statusBarHeight : 0
+        let update = {
+            self.statusBarHeightConstraint?.constant = targetHeight
+            self.statusBar.alphaValue = shouldShow ? 1.0 : 0.0
+        }
+
+        if animated {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.2
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                self.statusBar.animator().alphaValue = shouldShow ? 1.0 : 0.0
+                self.statusBarHeightConstraint?.animator().constant = targetHeight
+            }
+        } else {
+            update()
+        }
     }
 
     // MARK: - Future Enhancements

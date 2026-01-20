@@ -44,6 +44,11 @@ class VulpesConfig {
 
     // Home page
     var homePage: String = "https://ejfox.com"
+    var allowHttp: Bool = false
+
+    // Status bar (tmux-style)
+    var statusBarTemplate: String = "{{title}}  {{url}}  {{scroll}}  {{links}} links"
+    var statusBarAlwaysVisible: Bool = true
 
     // OpenRouter (LLM title cleanup)
     var openRouterEnabled: Bool = false
@@ -92,6 +97,8 @@ class VulpesConfig {
 
         # Home page
         home_page = https://ejfox.com
+        # Allow insecure HTTP (disabled by default)
+        # allow_http = false
 
         # Font size (points)
         font_size = 16
@@ -125,6 +132,10 @@ class VulpesConfig {
         # Scrolling
         scroll_speed = 40
         smooth_scrolling = true
+
+        # Status bar (tmux-style)
+        status_bar_template = {{title}}  {{url}}  {{scroll}}  {{links}} links
+        status_bar_always_visible = true
 
         # Particle effects on link clicks
         particles_enabled = true
@@ -172,6 +183,15 @@ class VulpesConfig {
         switch key {
         case "home_page":
             homePage = value
+
+        case "allow_http":
+            allowHttp = parseBool(value)
+
+        case "status_bar_template":
+            statusBarTemplate = value
+
+        case "status_bar_always_visible":
+            statusBarAlwaysVisible = parseBool(value)
 
         case "font_size":
             fontSize = Float(value) ?? fontSize

@@ -67,18 +67,10 @@ extension MetalView {
             spawnParticlesFromLink(hitBox: hitBox, color: SIMD3<Float>(0.4, 0.6, 1.0))
         }
 
-        var url = extractedLinks[index]
+        let url = extractedLinks[index]
+        let resolvedURL = resolveURLString(url) ?? url
 
-        // Handle relative URLs
-        if url.hasPrefix("/") {
-            // Construct absolute URL from current page
-            if let currentURLObj = URL(string: currentURL),
-               let baseURL = URL(string: "/", relativeTo: currentURLObj) {
-                url = baseURL.absoluteString.dropLast() + url
-            }
-        }
-
-        print("MetalView: Following link \(number): \(url)")
-        loadURL(url)
+        print("MetalView: Following link \(number): \(resolvedURL)")
+        loadURL(resolvedURL)
     }
 }

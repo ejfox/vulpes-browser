@@ -45,31 +45,50 @@ class VulpesBridge {
         let body: Data
     }
 
+    /// Fetch failure details (maps to vulpes_error_t)
+    struct FetchFailure {
+        let code: Int
+        let message: String
+    }
+
     /// Fetch a URL and return the response body.
     /// - Parameter url: The URL to fetch
     /// - Returns: FetchResult on success, nil on failure
     func fetch(url: String) -> FetchResult? {
+        switch fetchWithError(url: url) {
+        case .success(let result):
+            return result
+        case .failure:
+            return nil
+        }
+    }
+
+    /// Fetch a URL and return detailed errors on failure.
+    /// - Parameter url: The URL to fetch
+    /// - Returns: Result with FetchResult or FetchFailure
+    func fetchWithError(url: String) -> Result<FetchResult, FetchFailure> {
         NSLog("VulpesBridge: fetching \(url)")
 
         guard let result = vulpes_fetch(url) else {
             NSLog("VulpesBridge: fetch returned nil")
-            return nil
+            return .failure(FetchFailure(code: 99, message: "Unknown error (null response)"))
         }
         defer { vulpes_fetch_free(result) }
 
         guard result.pointee.error_code == 0 else {
-            NSLog("VulpesBridge: fetch error code: \(result.pointee.error_code)")
-            return nil
+            let code = Int(result.pointee.error_code)
+            NSLog("VulpesBridge: fetch error code: \(code)")
+            return .failure(FetchFailure(code: code, message: errorMessage(for: code)))
         }
 
         guard let bodyPtr = result.pointee.body else {
             NSLog("VulpesBridge: fetch returned nil body")
-            return FetchResult(status: result.pointee.status, body: Data())
+            return .success(FetchResult(status: result.pointee.status, body: Data()))
         }
 
         NSLog("VulpesBridge: fetch success - status \(result.pointee.status), \(result.pointee.body_len) bytes")
         let body = Data(bytes: bodyPtr, count: result.pointee.body_len)
-        return FetchResult(status: result.pointee.status, body: body)
+        return .success(FetchResult(status: result.pointee.status, body: body))
     }
 
     // MARK: - Text Extraction
@@ -151,6 +170,18 @@ class VulpesBridge {
         case 502: return "Bad Gateway"
         case 503: return "Service Unavailable"
         default: return "Error"
+        }
+    }
+
+    private func errorMessage(for code: Int) -> String {
+        switch code {
+        case 1: return "Engine not initialized"
+        case 2: return "Engine already initialized"
+        case 3: return "Invalid URL"
+        case 4: return "Out of memory"
+        case 5: return "Network error"
+        case 6: return "Parse error"
+        default: return "Unknown error"
         }
     }
 }

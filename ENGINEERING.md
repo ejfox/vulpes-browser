@@ -442,6 +442,7 @@ class NavigationHistory {
 - [x] Link cycling (Tab key)
 - [x] Smooth scrolling (keyboard + trackpad)
 - [x] Config file support (~/.config/vulpes/config)
+- [x] Tmux-style status bar with template config
 
 **In Progress:**
 - [ ] HTML form inputs
@@ -645,6 +646,7 @@ Compare to mainstream browsers:
 - Dark mode (system-aware)
 - Bookmarks sync (CloudKit?)
 - RSS reader integration
+- Link hover preview tooltip (thumbnail snapshot)
 
 ### Things We'll Probably Never Do
 
